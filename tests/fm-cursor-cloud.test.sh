@@ -262,10 +262,12 @@ test_finished_run_reports_pr_and_records_state() {
   IFS='|' read -r dir home fakebin id <<EOF
 $(new_case finished)
 EOF
-  sse_frame status '{"runId":"run-aaaa","status":"RUNNING"}' > "$dir/api/stream.1"
-  sse_frame assistant '{"text":"working on it"}' >> "$dir/api/stream.1"
-  sse_frame result '{"runId":"run-aaaa","status":"FINISHED"}' >> "$dir/api/stream.1"
-  sse_frame done '{}' >> "$dir/api/stream.1"
+  {
+    sse_frame status '{"runId":"run-aaaa","status":"RUNNING"}'
+    sse_frame assistant '{"text":"working on it"}'
+    sse_frame result '{"runId":"run-aaaa","status":"FINISHED"}'
+    sse_frame 'done' '{}'
+  } > "$dir/api/stream.1"
   cat > "$dir/api/run.1" <<'JSON'
 {"status":"FINISHED","durationMs":1200,"result":{"text":"bumped the date"},
  "git":{"branches":[{"repoUrl":"https://github.com/o/r","branch":"cursor/bump-1","prUrl":"https://github.com/o/r/pull/42"}]}}
@@ -530,6 +532,116 @@ EOF
   pass 'the cancel subcommand is idempotent and cancels only the recorded run'
 }
 
+# --- 8. pane-process identity -----------------------------------------------
+#
+# The shim is a `#!` script, and the kernel replaces such a script's own name
+# with its interpreter, so the pane process would report `bash` and the tmux
+# liveness classifier would call a live cloud worker `dead` - the one verdict
+# that can launch a duplicate agent onto a live worktree. bin/fm-spawn.sh's
+# launch template defeats that with an explicit `exec -a cursor-cloud`. This
+# case proves the whole chain with REAL processes and no tmux: that the explicit
+# argv[0] survives into what `ps` reports, that the classifier reads it as an
+# agent, and - driving the two apart deliberately - that the same command
+# WITHOUT it reads as a shell, so the assertion cannot go quietly vacuous.
+
+test_shim_pane_process_classifies_as_an_agent() {
+  local named_pid plain_pid named_argv plain_argv verdict stand_in
+  FM_BACKEND_LIB_DIR="$ROOT/bin"
+  # shellcheck source=bin/backends/tmux.sh
+  . "$ROOT/bin/backends/tmux.sh"
+
+  # A stand-in for the shim rather than the shim itself: it must be a MULTI-
+  # statement script run as `bash <path>`, which is exactly the shape the launch
+  # template produces. A single simple command would not do - bash execs straight
+  # into it, replacing the argv[0] under test.
+  stand_in="$TMP_ROOT/stand-in-shim.sh"
+  mkdir -p "$TMP_ROOT"
+  printf '#!/usr/bin/env bash\nsleep 30\nexit 0\n' > "$stand_in"
+  exec -a cursor-cloud bash "$stand_in" &
+  named_pid=$!
+  bash "$stand_in" &
+  plain_pid=$!
+  named_argv=$(LC_ALL=C ps -p "$named_pid" -o args= 2>/dev/null)
+  named_argv=${named_argv#"${named_argv%%[![:space:]]*}"}
+  named_argv=${named_argv%%[[:space:]]*}
+  plain_argv=$(LC_ALL=C ps -p "$plain_pid" -o args= 2>/dev/null)
+  plain_argv=${plain_argv#"${plain_argv%%[![:space:]]*}"}
+  plain_argv=${plain_argv%%[[:space:]]*}
+  kill "$named_pid" "$plain_pid" 2>/dev/null || true
+
+  [ "$(basename -- "$named_argv")" = cursor-cloud ] \
+    || fail "exec -a must put cursor-cloud in argv[0]; ps reported '$named_argv'"
+  [ "$(basename -- "$plain_argv")" != cursor-cloud ] \
+    || fail "the control process must NOT carry the shim's argv[0]; ps reported '$plain_argv'"
+
+  verdict=$(fm_backend_tmux_classify_process_name '' "$named_argv")
+  [ "$verdict" = agent ] \
+    || fail "the shim's pane process must classify as an agent, got '$verdict' for '$named_argv'"
+  verdict=$(fm_backend_tmux_classify_process_name '' "$plain_argv")
+  [ "$verdict" != agent ] \
+    || fail "without the explicit argv[0] the same process must NOT read as an agent, got '$verdict' for '$plain_argv'"
+  # The interpreter carrying the shim reports `bash` as its process name, so the
+  # explicit argv[0] has to outrank that shell name rather than lose to it.
+  verdict=$(fm_backend_tmux_classify_process_name bash cursor-cloud)
+  [ "$verdict" = agent ] \
+    || fail "argv[0] must outrank the interpreter's own name, got '$verdict'"
+  # macOS reports the overridden argv[0] through `ps -o comm=` while Linux
+  # reports the interpreter, so BOTH sources must carry the verdict on their own.
+  verdict=$(fm_backend_tmux_classify_process_name cursor-cloud)
+  [ "$verdict" = agent ] \
+    || fail "the name source alone must carry the verdict, got '$verdict'"
+  verdict=$(fm_backend_tmux_classify_process_name cursor-cloudy)
+  [ "$verdict" != agent ] \
+    || fail 'a name that merely starts with cursor-cloud must not read as an agent'
+  verdict=$(fm_backend_tmux_classify_process_name '' cursor-cloudy)
+  [ "$verdict" != agent ] \
+    || fail 'an argv[0] that merely starts with cursor-cloud must not read as an agent'
+  verdict=$(fm_backend_tmux_classify_process_name bash bash)
+  [ "$verdict" = shell ] \
+    || fail "a plain interpreter must still read as a shell, got '$verdict'"
+  pass 'the shim pane process is identified as a live agent, and only with its explicit argv[0]'
+}
+
+# --- 9. the control-plane and busy-state tables ------------------------------
+
+test_control_tables_declare_cursor_cloud() {
+  local got
+  # shellcheck source=bin/fm-control-lib.sh
+  . "$ROOT/bin/fm-control-lib.sh"
+  # shellcheck source=bin/fm-busy-lib.sh
+  . "$ROOT/bin/fm-busy-lib.sh"
+
+  fm_control_harness_supported cursor-cloud || fail 'cursor-cloud must be a supported control harness'
+  [ "$(fm_control_harness_family cursor-cloud)" = cursor-cloud ] \
+    || fail 'the recorded harness must map to the cursor-cloud family'
+  fm_control_harness_supports_kind cursor-cloud ship || fail 'cursor-cloud must run a ship task'
+  fm_control_harness_supports_kind cursor-cloud scout || fail 'cursor-cloud must run a scout task'
+  fm_control_harness_supports_kind cursor-cloud secondmate \
+    && fail 'cursor-cloud must be refused for a secondmate: its pane runs one cloud task, not a firstmate'
+
+  got=$(fm_control_interrupt_transport cursor-cloud)
+  [ "$got" = api ] || fail "cursor-cloud must interrupt over the API, got '$got'"
+  fm_control_interrupt_key cursor-cloud >/dev/null 2>&1 \
+    && fail 'cursor-cloud must expose no interrupt KEY: a key press cannot stop a cloud run'
+  [ "$(fm_control_interrupt_ack_source cursor-cloud)" = cursor-cloud-run-terminal ] \
+    || fail 'the cancellation acknowledgement must come from the run endpoint'
+  [ "$(fm_control_exit_command cursor-cloud)" = '!exit' ] \
+    || fail 'the exit command must be the shim line that cancels and stops'
+  [ "$(fm_control_harness_wiring_paths cursor-cloud /wt /st id1)" = /st/id1.cursor-cloud ] \
+    || fail 'the run record must be retired as per-task wiring on a relaunch'
+
+  got=$(fm_busy_sources_for_harness cursor-cloud)
+  case " $got " in
+    *" $FM_CURSOR_CLOUD_BUSY_SOURCE "*) ;;
+    *) fail "the shim's busy source must be trusted for cursor-cloud, got '$got'" ;;
+  esac
+  case " $(fm_busy_sources_for_harness claude) " in
+    *" $FM_CURSOR_CLOUD_BUSY_SOURCE "*)
+      fail 'the shim busy source must not be trusted for another adapter' ;;
+  esac
+  pass 'the control-plane and busy-state tables declare cursor-cloud correctly'
+}
+
 test_sse_decode_complete_frames
 test_sse_decode_split_and_partial_frames
 test_sse_decode_types_an_untagged_frame_from_its_payload
@@ -548,3 +660,5 @@ test_exhausted_stream_retries_block_rather_than_fail
 test_missing_api_key_refuses_loudly
 test_api_key_never_reaches_argv_output_or_disk
 test_cancel_subcommand_is_idempotent_and_targeted
+test_shim_pane_process_classifies_as_an_agent
+test_control_tables_declare_cursor_cloud

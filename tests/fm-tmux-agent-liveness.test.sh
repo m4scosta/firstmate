@@ -172,6 +172,47 @@ for decoy in musescore amuse muse-binary muse-bind; do
 done
 pass "tmux liveness: unrelated muse-containing command names stay ambiguous"
 
+# --- the cursor-cloud shim's explicit argv[0] --------------------------------
+# cursor-cloud's pane runs firstmate's OWN shim, a `#!` bash script, so the
+# kernel replaces its name with the interpreter and every executable-name source
+# reports `bash`. Without the explicit `exec -a cursor-cloud` the pane reads as an
+# idle shell and a live cloud worker classifies `dead` - the one verdict that can
+# launch a duplicate agent onto a live worktree. The decoy is what keeps the fix
+# an exact name rather than a prefix that would claim unrelated programs.
+
+cat > "$LAB/bin/shim-standin.sh" <<'SH'
+#!/usr/bin/env bash
+sleep 900
+exit 0
+SH
+chmod +x "$LAB/bin/shim-standin.sh"
+# The stand-in must stay a MULTI-statement script: bash execs straight into a
+# single simple command, which would replace the very argv[0] under test.
+make_argv0_launcher() {  # <name>
+  cat > "$LAB/bin/launch-$1" <<SH
+#!/usr/bin/env bash
+exec -a $1 bash "$LAB/bin/shim-standin.sh"
+SH
+  chmod +x "$LAB/bin/launch-$1"
+}
+make_argv0_launcher cursor-cloud
+make_argv0_launcher cursor-cloudy
+
+new_window cursorcloud "$LAB/bin/launch-cursor-cloud"
+wait_for_state "$SESSION:cursorcloud" alive \
+  || fail "the cursor-cloud shim's pane must classify alive from its explicit argv[0]"
+assert_sources_disagree "$SESSION:cursorcloud" "cursor-cloud shim argv[0]"
+pass "tmux liveness: the cursor-cloud shim's explicit argv[0] classifies alive"
+
+# `ambiguous` rather than `dead` is the platform-stable expectation here: the
+# stand-in's own `sleep` child sits in the same foreground process group and is
+# attributable to nothing, which is exactly the fail-closed verdict wanted - not
+# alive, and not confidently agent-free either.
+new_window cursorcloud-decoy "$LAB/bin/launch-cursor-cloudy"
+wait_for_state "$SESSION:cursorcloud-decoy" ambiguous \
+  || fail "an argv[0] that merely starts with cursor-cloud must not classify as a live agent pane"
+pass "tmux liveness: only the exact cursor-cloud argv[0] classifies as a live agent"
+
 # --- a version name blinds one source ---------------------------------------
 # Giving a genuine harness-named executable the version-string argv[0] that
 # Claude Code 2.1.220 reports drives the two sources apart on both supported
