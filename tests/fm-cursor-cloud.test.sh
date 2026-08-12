@@ -264,13 +264,19 @@ $(new_case finished)
 EOF
   {
     sse_frame status '{"runId":"run-aaaa","status":"RUNNING"}'
-    sse_frame assistant '{"text":"working on it"}'
+    sse_frame assistant '{"text":"working"}'
+    sse_frame assistant '{"text":" on"}'
+    sse_frame assistant '{"text":" it"}'
     sse_frame result '{"runId":"run-aaaa","status":"FINISHED"}'
     sse_frame 'done' '{}'
   } > "$dir/api/stream.1"
+  # repoUrl is quoted exactly as the live API returns it: no scheme, and here
+  # alongside another repository's branch, so the case proves the task's own
+  # repository is selected rather than whichever branch happens to come first.
   cat > "$dir/api/run.1" <<'JSON'
 {"status":"FINISHED","durationMs":1200,"result":{"text":"bumped the date"},
- "git":{"branches":[{"repoUrl":"https://github.com/o/r","branch":"cursor/bump-1","prUrl":"https://github.com/o/r/pull/42"}]}}
+ "git":{"branches":[{"repoUrl":"github.com/other/repo","branch":"cursor/wrong","prUrl":"https://github.com/other/repo/pull/1"},
+                    {"repoUrl":"github.com/o/r","branch":"cursor/bump-1","prUrl":"https://github.com/o/r/pull/42"}]}}
 JSON
   out=$(run_shim "$dir" "$home" "$fakebin" "$id" < /dev/null)
   status_file="$home/state/$id.status"
@@ -285,6 +291,8 @@ JSON
   rec=$(fm_cursor_cloud_record_get "$home/state" "$id" agent)
   [ "$rec" = bc-1111 ] || fail "the run record must record the agent id, got '$rec'"
   assert_contains "$out" 'assistant: working on it' 'stream events are rendered into the pane'
+  [ "$(printf '%s\n' "$out" | grep -c 'assistant: ')" = 1 ] \
+    || fail "consecutive assistant deltas must coalesce onto one pane line, got: $out"
   assert_line "$dir/api/call.log" 'POST https://api.cursor.com/v1/agents' \
     'the launch is a POST to /v1/agents'
   assert_line "$dir/api/call.log" 'GET https://api.cursor.com/v1/agents/bc-1111/runs/run-aaaa' \
@@ -415,7 +423,7 @@ EOF
   sse_frame assistant '{"text":"halfway"}' > "$dir/api/stream.1"
   cat > "$dir/api/run.1" <<'JSON'
 {"status":"FINISHED","result":"finished while the stream was down",
- "git":{"branches":[{"repoUrl":"https://github.com/o/r","branch":"cursor/x","prUrl":"https://github.com/o/r/pull/7"}]}}
+ "git":{"branches":[{"repoUrl":"github.com/O/R.git","branch":"cursor/x","prUrl":"https://github.com/o/r/pull/7"}]}}
 JSON
   out=$(run_shim "$dir" "$home" "$fakebin" "$id" < /dev/null)
   assert_contains "$out" 'the run endpoint reports FINISHED' \

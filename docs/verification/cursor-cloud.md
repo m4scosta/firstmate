@@ -8,11 +8,12 @@ Active empirical evidence for firstmate's `cursor-cloud` adapter.
 | Field | Value |
 |---|---|
 | Surface | Cursor Agents REST API, base `https://api.cursor.com` |
-| Verified | 2026-08-12 |
+| Verified | 2026-08-12, including a live plan-mode run |
 | Platform | macOS arm64 (Darwin 25.5.0), `curl` 8.x, `jq` 1.7.1 |
 | Auth | HTTP basic, `CURSOR_API_KEY` as username with an empty password |
 
-Every probe below is a READ, so none of it launched an agent or incurred run cost.
+Every probe in the sections before "Live plan-mode run" is a READ, so none of it launched an agent or incurred run cost; `GET /v1/agents` and `GET /v1/models` are therefore the safe refresh commands.
+That one live run is the exception and is scoped accordingly: plan mode, no pull request, one captain-approved repository.
 Response bodies are quoted with account-identifying values removed and long arrays truncated where marked.
 
 ## Auth reaches the account
@@ -98,11 +99,50 @@ $ curl -sS -u "$CURSOR_API_KEY": https://api.cursor.com/v1/agents/models
 {"error":{"code":"validation_error","message":"Agent ID must be in the format 'bc-<uuid>'"}}
 ```
 
+## Live plan-mode run
+
+One captain-approved plan-mode run against `https://github.com/Faire/backend` at `main`, launched with `mode: "plan"` and `autoCreatePR: false`, so it read the repository and opened no pull request.
+It exercised launch, the event stream, the status mapping, the queue-while-running steer path, a follow-up run, terminal reconciliation, cancellation, and shim exit.
+Observed, in order:
+
+```
+[cursor-cloud] agent bc-9637084d-... run run-aff7cd3f-... (RUNNING) https://cursor.com/agents/bc-9637084d-...
+[cursor-cloud] status: working: cursor cloud run run-aff7cd3f-... under way
+[cursor-cloud] steer QUEUED (1 waiting): run run-aff7cd3f-... is RUNNING and only one run may be active. ...
+[cursor-cloud] run run-aff7cd3f-... status FINISHED
+[cursor-cloud] result FINISHED
+[cursor-cloud] status: done: This repo has many top-level services ... (no PR opened)
+[cursor-cloud] submitting queued steer(s) now that the run is FINISHED
+[cursor-cloud] steer submitted as run run-e91cf25e-... (CREATING)
+[cursor-cloud] cancelling run run-e91cf25e-...
+[cursor-cloud] cancel cancelled
+[cursor-cloud] status: failed: run cancelled
+[cursor-cloud] exit requested
+```
+
+Both runs were confirmed terminal from the run endpoint afterwards, so the shim left nothing active:
+
+```
+$ curl -sS -u "$CURSOR_API_KEY": .../runs/run-e91cf25e-... | jq -c '{status, durationMs, git}'
+{"status":"CANCELLED","durationMs":16485,"git":{"branches":[{"repoUrl":"github.com/Faire/backend","branch":"cursor/service-structure-and-endpoints-5d24"}]}}
+$ curl -sS -u "$CURSOR_API_KEY": .../runs/run-aff7cd3f-... | jq -c '{status, git}'
+{"status":"FINISHED","git":{"branches":[{"repoUrl":"github.com/Faire/backend","branch":"cursor/service-structure-and-endpoints-5d24"}]}}
+```
+
+Three shapes in that output differ from what the documented examples suggest, and the adapter follows the live API:
+
+- `git.branches[].repoUrl` carries NO scheme (`github.com/Faire/backend`). A raw string comparison against the task's own `https://...` repository URL would never match, leaving the repository selection silently dead and, on a multi-repository agent, able to attribute another repository's branch and pull request to the task. `reconcile` normalizes both sides to a scheme-less, userless, suffix-less, lowercase identity.
+- `agent.url` is `https://cursor.com/agents/<agent-id>`.
+- `assistant` and `thinking` events arrive as token DELTAS, several per second, each a fragment of a word. Rendering one prefixed pane line per event buried the run in fragments, so consecutive deltas of the same kind are coalesced onto one line, closed when the kind changes or another event arrives.
+
+A plan-mode run still reported a `git.branches[]` entry with a branch name and no `prUrl`, which is why a `FINISHED` run without a pull request has its own status line rather than being treated as an error.
+
 ## What is not verified here
 
-- The launch, follow-up, run-read, stream, and cancel responses are exercised against a mocked HTTP layer in `tests/fm-cursor-cloud.test.sh` and against Cursor's documented shapes, not yet against a live run. A live end-to-end smoke needs a captain-approved target repository, because launching a cloud agent that opens a pull request is outward-facing.
-- The `env` object's accepted `type` values are taken from Cursor's documentation; only the `cloud` form is used, and only when `config/cursor-cloud-env` names an environment.
-- No Server-Sent-Events frame has been read from the live stream endpoint. The decoder is pinned instead by `tests/fm-cursor-cloud.test.sh`, which drives complete frames, a payload split across `data:` lines, keepalive comments, CRLF line endings, and a frame the stream never terminated.
+- No live `tool_call` event was observed: the plan-mode run reached its answer without one. That renderer is covered only by `tests/fm-cursor-cloud.test.sh`.
+- No live `error` frame was observed, so that renderer is likewise test-covered only.
+- The `env` object's accepted `type` values are taken from Cursor's documentation; only the `cloud` form is used, and only when `config/cursor-cloud-env` names an environment. The live run passed no `env` and the cloud agent resolved the repository's own environment on its own.
+- The dropped-stream reconnect path was not forced live; it is pinned by `tests/fm-cursor-cloud.test.sh`, which drives a stream that ends without a terminal event, a run endpoint that still reads `RUNNING`, and an exhausted retry budget.
 
 ## Refresh
 

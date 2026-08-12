@@ -405,9 +405,18 @@ reconcile() {
       return 0
       ;;
   esac
+  # The live API returns `git.branches[].repoUrl` with NO scheme
+  # (`github.com/o/r`), so both sides are normalized to a scheme-less, userless,
+  # suffix-less, lowercase identity before comparison. Comparing raw strings would
+  # make the repository match silently dead and, with more than one repo on an
+  # agent, could attribute another repository's branch and pull request to this
+  # task. The unmatched fallback stays deliberately: a single-repo agent must still
+  # report its branch even if Cursor changes that field's shape again.
   jq -r --arg repo "$REPO" '
     def clean: (. // "") | tostring | gsub("[\n\r\t\u001f]"; " ");
-    ([.git.branches[]? | select((.repoUrl // $repo) | sub("\\.git$"; "") == $repo)] + [.git.branches[]?])[0] as $b
+    def norm: (. // "") | tostring | sub("^[a-zA-Z][a-zA-Z0-9+.-]*://"; "") | sub("^[^/]*@"; "") | sub("\\.git$"; "") | ascii_downcase;
+    ($repo | norm) as $want
+    | ([.git.branches[]? | select((.repoUrl | norm) == $want)] + [.git.branches[]?])[0] as $b
     | [ (.status // "" | clean),
         ($b.prUrl // "" | clean),
         ($b.branch // "" | clean),
@@ -447,11 +456,19 @@ finalize_run() {  # <status> <pr> <branch> <text>
 # loop stays free to read steers from stdin.
 stream_run() {  # <fifo>
   local fifo=$1 marker="$CC_TMP/terminal" type data text name tool_status status
+  local open=''
   rm -f "$marker"
   cc_curl -N -H 'Accept: text/event-stream' \
     "$CC_BASE/v1/agents/$AGENT_ID/runs/$RUN_ID/stream" 2>/dev/null \
     | fm_cursor_cloud_sse_decode \
-    | while IFS=$'\t' read -r type data; do
+    | { while IFS=$'\t' read -r type data; do
+        # Close an open delta line before any event that is not more of it.
+        if [ -n "$open" ]; then
+          case "$type" in
+            assistant|thinking) ;;
+            *) printf '\n'; open= ;;
+          esac
+        fi
         case "$type" in
           status)
             status=$(printf '%s' "$data" | jq -r '.status // empty' 2>/dev/null) || status=
@@ -461,8 +478,18 @@ stream_run() {  # <fifo>
             fi
             ;;
           assistant|thinking)
+            # These arrive as token DELTAS, several per second, so one prefixed
+            # line per event would bury the pane in fragments. Consecutive deltas
+            # of the same kind extend the line already open, and the line is closed
+            # above as soon as the kind changes or any other event arrives.
             text=$(printf '%s' "$data" | jq -r '.text // empty' 2>/dev/null) || text=
-            [ -z "$text" ] || printf '%s\n' "$text" | sed "s/^/[cursor-cloud] $type: /"
+            [ -n "$text" ] || continue
+            if [ "$open" = "$type" ]; then
+              printf '%s' "$text"
+            else
+              printf '[cursor-cloud] %s: %s' "$type" "$text"
+              open=$type
+            fi
             ;;
           tool_call)
             name=$(printf '%s' "$data" | jq -r '.name // "tool"' 2>/dev/null) || name=tool
@@ -484,6 +511,10 @@ stream_run() {  # <fifo>
           *) ;;
         esac
       done
+      # Inside the pipeline's own subshell, where `open` actually lives: a stream
+      # that ends mid-delta still leaves the pane's last line terminated.
+      [ -z "$open" ] || printf '\n'
+    }
   if [ -s "$marker" ]; then
     printf 'terminal\t%s\n' "$(cat "$marker")" > "$fifo"
   else
