@@ -31,7 +31,8 @@
     "docs/zellij-backend.md",
     "docs/orca-backend.md",
     "docs/cmux-backend.md",
-    "docs/remote-secondmates.md"
+    "docs/remote-secondmates.md",
+    "docs/cursor-cloud-harness.md"
   ],
   "requiredOwnerPointers": [
     {
@@ -241,6 +242,10 @@
       "audience": "operator-current"
     },
     {
+      "path": "docs/cursor-cloud-harness.md",
+      "audience": "operator-current"
+    },
+    {
       "path": "docs/decision-hold-lifecycle.md",
       "audience": "maintainer-architecture"
     },
@@ -327,6 +332,10 @@
     {
       "path": "docs/turnend-guard.md",
       "audience": "operator-current"
+    },
+    {
+      "path": "docs/verification/cursor-cloud.md",
+      "audience": "maintainer-verification"
     },
     {
       "path": "docs/verification/dispatch-auth.md",

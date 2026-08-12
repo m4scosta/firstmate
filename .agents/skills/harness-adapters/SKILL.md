@@ -1,6 +1,6 @@
 ---
 name: harness-adapters
-description: Agent-only reference for firstmate harness operations. Use before spawning or recovering a crewmate or secondmate, handling a trust dialog, sending a harness-specific skill invocation, interrupting or exiting an agent, resuming an exited agent, or verifying a new harness adapter. Contains verified facts for claude, codex, opencode, pi, pi-signed, grok, kimi, and muse.
+description: Agent-only reference for firstmate harness operations. Use before spawning or recovering a crewmate or secondmate, handling a trust dialog, sending a harness-specific skill invocation, interrupting or exiting an agent, resuming an exited agent, or verifying a new harness adapter. Contains verified facts for claude, codex, opencode, pi, pi-signed, grok, kimi, muse, and cursor-cloud.
 user-invocable: false
 metadata:
   internal: true
@@ -125,6 +125,7 @@ The supported launch-profile flags below are verified locally; each row records 
 | pi / pi-signed | `--model <model>` | `--thinking <low\|medium\|high\|xhigh\|max>` | Verified 2026-07-27 on Pi and pi-signed 0.82.0. Both expose the same accepted thinking levels and completed the same model-qualified max-thinking smoke. |
 | opencode | `--model <provider/model>` | none for firstmate's interactive launch | Verified on opencode 1.17.6. `opencode run` has `--variant`, but firstmate launches the interactive `opencode --prompt` path, which has no verified effort flag. |
 | kimi | `--model <model>` | none | Verified 2026-07-25 on Kimi Code CLI 0.29.1. |
+| cursor-cloud | `--model <model>` | `--effort <low\|medium\|high\|xhigh\|max>` | Verified 2026-08-12 against Cursor's Agents API. Effort is a MODEL PARAMETER, not a flag: the shim maps the level onto whichever parameter that model carries it in (`effort` for the Claude, Grok, and Gemini models, `reasoning` for the GPT, Kimi, and GLM ones) and drops a level the model does not accept. The whole shared vocabulary is passed through here because the per-model ceiling is read from Cursor's catalog at launch rather than from a table that would rot; `max` still requires an explicit captain preference. |
 | muse | `--model <model>` | `--reasoning-effort <low\|medium\|high\|xhigh>`, and `ultra` only for an explicit `max` | Verified 2026-08-05 on Muse Code 0.1.0-R708.1. The flag accepts `none\|minimal\|low\|medium\|high\|xhigh\|ultra` and defaults to `high`. `ultra` is muse's max-class level, so it is reachable only through an explicit captain `max`, never from the generic fallback; `none` and `minimal` sit below the shared vocabulary and stay unreachable. |
 
 The concrete `harness` field owns adapter identity independently of the model provider: `harness=pi` with `model=xai/grok-*` is Pi using xAI, not `harness=grok`, and does not require Grok CLI login; `harness=grok` remains the standalone Grok Build CLI adapter.
@@ -143,6 +144,7 @@ Use the discovery surface in the current authenticated environment because suppo
 | pi / pi-signed | Run the selected executable as `<executable> --list-models [search]`; Pi's installed `docs/models.md` owns how built-in, extension-registered, and custom provider/model entries reach that list. |
 | grok | Run `grok models`, which lists the models available to the current Grok installation and account. |
 | kimi | Run `kimi provider list --json`, which lists the current provider and model configuration. |
+| cursor-cloud | `GET https://api.cursor.com/v1/models` with the account's `CURSOR_API_KEY`, which lists every model id available to that account together with each one's accepted parameters and values. It is a read, so it launches nothing and costs nothing. |
 
 For an unfamiliar harness or model namespace, establish support and provider identity from that harness's authoritative CLI help, model listing, or current documentation rather than guessing from a name or prefix.
 A listing that reaches the account and does not contain the model is concrete evidence the model is unsupported: block that candidate and quote the result.
@@ -168,6 +170,8 @@ Natural language is acceptable if uncertain.
 A send or key action reporting success is not proof that the intended action happened.
 OpenCode can accept and queue an Enter while leaving text visible, Grok can consume Enter in its slash popup without submitting, and Kimi can silently drop a message sent before readiness even though the send returns success.
 The shared symptom is a healthy-looking pane with no work in progress, so each adapter must verify the observable postcondition that is specific to its TUI.
+cursor-cloud sits outside that whole class: it draws no composer, so no composer-shaped verdict applies to it, and `fm-send` confirms a steer from the shim's own accepted-input counter instead.
+Never treat a `pending` or `unknown` composer reading of a cursor-cloud pane as a delivery verdict.
 
 ## claude (VERIFIED; busy-state hooks live-verified 2026-07-28 on Claude Code 2.1.220)
 
@@ -465,3 +469,59 @@ A teardown refusal naming muse scratch is therefore correct behavior: inspect it
 muse is a day-0 `0.1.0` beta whose launcher polls a release channel hourly and can replace the running binary underneath the fleet, changing the process name with it.
 The captain accepted that risk, so firstmate does NOT set `MUSE_NO_AUTO_UPDATE=1`; a fleet that later wants stability can set it in the launch environment without any adapter change.
 Its plugin/hook engine reports `plugins are not available in this build` unless `MUSE_EXPERIMENTAL_PLUGINS=on`, which is why the busy source reads the session log instead of installing a hook.
+
+## cursor-cloud (VERIFIED 2026-08-12, Cursor Agents REST API)
+
+cursor-cloud is a CREWMATE and SCOUT adapter only, and the only adapter whose work does not run on this machine.
+The task still gets an ordinary isolated worktree and an ordinary session endpoint; what runs inside that endpoint is firstmate's own shim, `bin/fm-cursor-cloud.sh`, driving a Cursor Cloud Agent over `https://api.cursor.com`.
+`bin/fm-spawn.sh` refuses `--secondmate` on it because that pane runs one cloud task rather than a firstmate instance that could hold a session lock and supervise a fleet.
+[`docs/cursor-cloud-harness.md`](../../../docs/cursor-cloud-harness.md) owns operator setup and [`docs/verification/cursor-cloud.md`](../../../docs/verification/cursor-cloud.md) owns the API evidence.
+
+| Fact | Value |
+|---|---|
+| Binary | None. The pane runs `exec -a cursor-cloud bash <firstmate>/bin/fm-cursor-cloud.sh run ...`; nothing from Cursor is installed locally. |
+| Launch | The brief is passed as a PATH, not typed: the shim reads the file and sends its text as the cloud run's prompt, because there is no composer to paste into. |
+| Credential | `CURSOR_API_KEY` in the environment the session provider's daemon inherits. Absent is a loud refusal before any request; escalate it to the captain as a needed credential. The key rides a `-K -` curl config on stdin, so it never enters argv, disk, or output. |
+| Models | `--model <model>`; ids come from `GET /v1/models`. The bracket form `claude-opus-5[effort=high]` is also accepted and its explicit parameters win. |
+| Busy state | `cursor-cloud-shim`, the shim's own run lifecycle: busy on every run it creates, idle on every terminal run status, unknown when the event stream could not be re-established. It is armed like the other converted adapters because firstmate's own process is the writer, so a seeded record always has something that can clear it. |
+| Exit command | `!exit`, a plain input line rather than a slash command. It cancels any live run before stopping, so an exit never leaves one billing. |
+| Interrupt | No key. The control plane's `api` transport calls the shim's own cancel path, which cancels the active run and confirms it from `GET /v1/agents/{id}/runs/{runId}`. A key press typed into this pane could not stop a cloud run, so `fm_control_interrupt_key` deliberately returns nothing for it. |
+| Skill invocation | None. There is no local agent to invoke a skill on, and `no-mistakes` is unavailable by construction. |
+| Autonomy | Inherent: the cloud agent runs unattended with no approval gate to disable. |
+| Trust dialog | None. |
+| Environment marker | None, and `bin/fm-harness.sh` never returns it: no firstmate session can itself be running on this harness. |
+| Composer | None. The pane is a rendered event log, so every composer-shaped verdict for it is meaningless; steer delivery is confirmed from the shim's accepted-input counter instead. |
+| Effort | A model parameter rather than a flag; see the launch-profile table above. |
+| Resume | None. A relaunch carries the brief plus its progress note into a fresh cloud run, which is the deterministic path for every adapter anyway. |
+
+### Delivery is direct-PR only, by construction
+
+`no-mistakes` runs in a local worktree with local tooling, none of which exists inside a cloud agent, so a cursor-cloud ship task can never run firstmate's validation pipeline.
+Resolve every cursor-cloud ship task as `direct-PR` at intake: the run is launched with `autoCreatePR`, and the pull request the cloud agent opens IS the deliverable.
+Never select `no-mistakes` for one, never treat the cloud agent's own self-review as a substitute for it, and when a change genuinely needs the pipeline, dispatch it on a local harness instead.
+
+### Steers queue, and the pane says so
+
+The API permits one active run per agent.
+A steer arriving while the run is `CREATING` or `RUNNING` is queued and submitted as the next run when the current one goes terminal; the pane states plainly that it has not been delivered yet, so reading the pane can never mislead a supervisor into thinking it landed.
+`!cancel` is the one input line that stops the live run instead of queueing.
+Several queued steers are submitted together as one follow-up.
+
+### A dropped stream is not an outcome
+
+`GET /v1/agents/{id}/runs/{runId}` is the ONLY authority on whether a run is terminal.
+The shim reconnects the event stream with backoff and reconciles against that endpoint on every attempt, so a lost connection is never reported as a finished or failed run.
+Only an exhausted retry budget produces `blocked: lost contact with cloud run <runId>`, which says the run may still be running rather than claiming an outcome.
+Treat that line as a live run needing attention, not as a failure.
+
+### The pane process is identified by argv[0]
+
+The shim is a `#!` script, and the kernel replaces such a script's name with its interpreter, so every executable-name source would report `bash` and a live cloud worker would classify `dead` - the one liveness verdict that can launch a duplicate agent onto a live worktree.
+The launch template defeats that with an explicit `exec -a cursor-cloud`, and `bin/backends/tmux.sh` matches that name from both name sources because macOS reports the overridden argv[0] through `ps -o comm=` while Linux reports the interpreter.
+Never change the launch command's `exec -a` without changing that classifier and `tests/fm-tmux-agent-liveness.test.sh` in the same commit.
+
+### Cost is a real boundary
+
+A launched run bills until it finishes or is cancelled, and nothing consumes its output once its shim is gone.
+The shim cancels any still-active run when it exits, and `bin/fm-teardown.sh` cancels one independently in case the shim was already gone - but only once teardown is committed, because cancelling a run for a teardown that is then refused would destroy work the task still owns.
+A teardown warning that it could not confirm the run stopped is captain-relevant: an orphaned run keeps costing money, and <https://cursor.com/agents> is where it is stopped by hand.

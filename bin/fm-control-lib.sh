@@ -63,7 +63,7 @@ fm_control_verb_allowed() {  # <verb>
 # than guessed at, exactly as a spawn on it would be.
 fm_control_harness_supported() {  # <harness>
   case "${1-}" in
-    claude|codex|opencode|pi|pi-signed|grok|kimi|muse) return 0 ;;
+    claude|codex|opencode|pi|pi-signed|grok|kimi|muse|cursor-cloud) return 0 ;;
   esac
   return 1
 }
@@ -86,22 +86,37 @@ fm_control_harness_family() {  # <recorded-harness>
     grok*) printf 'grok' ;;
     kimi*) printf 'kimi' ;;
     muse*) printf 'muse' ;;
+    cursor-cloud*) printf 'cursor-cloud' ;;
     *) return 1 ;;
   esac
 }
 
-# Which task kinds an adapter is verified to run. muse is a crewmate/scout
-# adapter only: it has no primary supervision protocol, and bin/fm-spawn.sh
-# refuses a --secondmate launch on it. The control plane asks this BEFORE it
-# stops anything, so an incompatible relaunch target is refused while the
-# current agent is still running rather than after it has been stopped.
+# Which task kinds an adapter is verified to run. muse and cursor-cloud are
+# crewmate/scout adapters only, and bin/fm-spawn.sh refuses a --secondmate launch
+# on either: muse has no primary supervision protocol, and a cursor-cloud pane
+# runs a shim that executes one cloud task rather than a firstmate instance that
+# could supervise a fleet. The control plane asks this BEFORE it stops anything,
+# so an incompatible relaunch target is refused while the current agent is still
+# running rather than after it has been stopped.
 fm_control_harness_supports_kind() {  # <harness> <kind>
   local harness=${1-} kind=${2-}
   fm_control_harness_supported "$harness" || return 1
   case "$harness" in
-    muse) [ "$kind" != secondmate ] || return 1 ;;
+    muse|cursor-cloud) [ "$kind" != secondmate ] || return 1 ;;
   esac
   return 0
+}
+
+# How an adapter's interrupt is DELIVERED. Every terminal-UI adapter takes a
+# key press; cursor-cloud takes an API call, because the turn being cancelled is
+# a cloud run and no key sequence typed into its pane could stop one. A harness
+# with no verified mechanics returns nonzero, matching the tables below.
+fm_control_interrupt_transport() {  # <harness> -> key|api
+  case "${1-}" in
+    cursor-cloud) printf 'api' ;;
+    claude|codex|opencode|pi|pi-signed|grok|kimi|muse) printf 'key' ;;
+    *) return 1 ;;
+  esac
 }
 
 # The key that cancels a running turn. Escape for every adapter except grok,
@@ -110,6 +125,9 @@ fm_control_interrupt_key() {  # <harness>
   case "${1-}" in
     claude|codex|opencode|pi|pi-signed|kimi|muse) printf 'Escape' ;;
     grok) printf 'C-c' ;;
+    # cursor-cloud is deliberately absent: its interrupt transport is `api`, and
+    # returning a key for it would let a caller type one at a shim that has no
+    # composer to type into instead of cancelling the cloud run.
     *) return 1 ;;
   esac
 }
@@ -139,19 +157,28 @@ fm_control_interrupt_clear_key() {  # <harness>
   esac
 }
 
+# Which adapter-owned cancellation acknowledgement is observable. cursor-cloud
+# has the strongest of them: GET /v1/agents/{id}/runs/{runId} states the run's
+# own terminal status, so a cancel is confirmed from the vendor's record rather
+# than inferred.
 fm_control_interrupt_ack_source() {  # <harness>
   case "${1-}" in
     muse) printf 'muse-session-terminal' ;;
+    cursor-cloud) printf 'cursor-cloud-run-terminal' ;;
     claude|codex|opencode|pi|pi-signed|grok|kimi) printf 'none' ;;
     *) return 1 ;;
   esac
 }
 
-# The command that exits the agent from its own composer.
+# The command that exits the agent from its own composer. cursor-cloud's shim
+# reads plain lines from stdin rather than slash commands, and `!exit` is the one
+# it treats as a lifecycle instruction (bin/fm-cursor-cloud.sh); it cancels any
+# still-active cloud run before stopping, so an exit never leaves one billing.
 fm_control_exit_command() {  # <harness>
   case "${1-}" in
     claude|opencode|grok|kimi|muse) printf '/exit' ;;
     codex|pi|pi-signed) printf '/quit' ;;
+    cursor-cloud) printf '!exit' ;;
     *) return 1 ;;
   esac
 }
@@ -213,6 +240,13 @@ fm_control_harness_wiring_paths() {  # <harness> <worktree> <state-dir> <id>
       # so no retired incarnation's session binding outlives the agent.
       printf '%s\n' "$state/$id.muse-session"
       printf '%s\n' "$state/$id.muse-session-current"
+      ;;
+    cursor-cloud)
+      # The shim's run record is what binds this task to a live cloud run. A
+      # relaunch must retire it so the replacement shim cannot adopt the retired
+      # incarnation's agent, and so a stale record cannot make teardown try to
+      # cancel a run that belongs to no task.
+      printf '%s\n' "$state/$id.cursor-cloud"
       ;;
   esac
 }

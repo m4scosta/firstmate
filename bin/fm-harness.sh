@@ -18,6 +18,9 @@
 # harness only, no model/effort. Only the first non-empty, non-comment line is parsed.
 # Model/effort come ONLY from this file - config/crew-harness stays a bare adapter
 # name and is never parsed for a model.
+# config/crew-harness may also name cursor-cloud, which detect_own deliberately
+# never returns: that harness's pane runs firstmate's own shim against Cursor's
+# cloud, so no firstmate session can itself be running on it.
 # Detection layers: verified environment markers first, then process ancestry.
 # Record each newly verified env marker here.
 set -u

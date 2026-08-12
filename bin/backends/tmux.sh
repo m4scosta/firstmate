@@ -167,17 +167,35 @@ fm_backend_tmux_classify_process_name() {  # <path> [argv0] -> agent|shell|other
     # would classify musescore or amuse as a live agent pane. The install path
     # cannot carry it either: ~/.local/bin/muse-bin-<version> has no `muse` path
     # COMPONENT, so the fm_harness_path_name fallback below never fires for it.
-    muse|muse-bin-*) printf 'agent' ;;
-    *claude*|*codex*|*opencode*|*grok*|*kimi*|pi|pi-signed|pi-launcher|Pi) printf 'agent' ;;
-    zsh|bash|sh|dash|ash|ksh|mksh|tcsh|csh|fish) printf 'shell' ;;
-    *)
-      if fm_harness_path_name "$path" >/dev/null || fm_harness_path_name "$argv0" >/dev/null; then
-        printf 'agent'
-      else
-        printf 'other'
-      fi
-      ;;
+    muse|muse-bin-*) printf 'agent'; return 0 ;;
+    *claude*|*codex*|*opencode*|*grok*|*kimi*|pi|pi-signed|pi-launcher|Pi) printf 'agent'; return 0 ;;
+    # cursor-cloud is matched from BOTH name sources, here and from argv[0]
+    # below, so either can carry the positive verdict: macOS `ps -o comm=`
+    # reports the overridden argv[0] while Linux reports the interpreter, and
+    # neither platform's field assignment should be load-bearing.
+    cursor-cloud) printf 'agent'; return 0 ;;
   esac
+  # cursor-cloud is the one adapter whose identity can arrive in argv[0] rather
+  # than in an executable name, and it is checked BEFORE the shell names below
+  # because that argv[0] outranks the interpreter carrying it. Its pane process is firstmate's
+  # OWN shim, launched as `exec -a cursor-cloud bash <script>` (bin/fm-spawn.sh's
+  # launch template). The indirection is necessary rather than decorative: a `#!`
+  # script's own name never survives into argv[0], because the kernel replaces it
+  # with the interpreter, so the pane would otherwise report `bash`, read as an
+  # idle shell, and classify a live worker `dead` - the one verdict that can
+  # launch a duplicate agent onto a live worktree. Anchored, never globbed,
+  # because the name is firstmate's own choice and needs no fuzzy matching.
+  case "${argv0##*/}" in
+    cursor-cloud) printf 'agent'; return 0 ;;
+  esac
+  case "$base" in
+    zsh|bash|sh|dash|ash|ksh|mksh|tcsh|csh|fish) printf 'shell'; return 0 ;;
+  esac
+  if fm_harness_path_name "$path" >/dev/null || fm_harness_path_name "$argv0" >/dev/null; then
+    printf 'agent'
+  else
+    printf 'other'
+  fi
 }
 
 # fm_backend_tmux_foreground_comms: the kernel-side names of every process in
