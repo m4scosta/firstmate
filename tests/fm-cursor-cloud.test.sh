@@ -642,6 +642,172 @@ test_control_tables_declare_cursor_cloud() {
   pass 'the control-plane and busy-state tables declare cursor-cloud correctly'
 }
 
+# --- 10. the spawn and teardown paths ---------------------------------------
+#
+# These drive the REAL bin/fm-spawn.sh and bin/fm-teardown.sh with a fake tmux,
+# a fake treehouse, and a fake curl, the same shape tests/fm-grok-harness.test.sh
+# uses. Nothing here touches a real session provider, a real worktree pool, or
+# the network.
+
+make_spawn_fakebin() {  # <case-dir> -> prints the fakebin
+  local dir=$1 fakebin
+  fakebin=$(fm_fakebin "$dir")
+  cat > "$fakebin/tmux" <<'SH'
+#!/usr/bin/env bash
+set -u
+case "$*" in
+  *"#{pane_current_path}"*) printf '%s\n' "${FM_FAKE_PANE_PATH:-}"; exit 0 ;;
+esac
+case "${1:-}" in
+  send-keys) printf '%s\n' "$*" >> "$FM_FAKE_TMUX_LOG"; exit 0 ;;
+  display-message) printf 'firstmate\n'; exit 0 ;;
+  list-windows) exit 0 ;;
+  has-session|new-session|new-window|kill-window) exit 0 ;;
+esac
+exit 0
+SH
+  chmod +x "$fakebin/tmux"
+  cat > "$fakebin/curl" <<'SH'
+#!/usr/bin/env bash
+set -u
+cat >/dev/null
+prev= out= url= method=GET
+for a in "$@"; do
+  case "$prev" in -X) method=$a ;; -o) out=$a ;; esac
+  case "$a" in https://*) url=$a ;; esac
+  prev=$a
+done
+printf '%s %s\n' "$method" "$url" >> "$FM_FAKE_CURL_LOG"
+case "$url" in
+  */cancel) [ -z "$out" ] || : > "$out"; printf '200' ;;
+  */runs/*) [ -z "$out" ] || printf '{"status":"CANCELLED"}' > "$out"; printf '200' ;;
+  *) [ -z "$out" ] || : > "$out"; printf '200' ;;
+esac
+SH
+  chmod +x "$fakebin/curl"
+  fm_fake_exit0 "$fakebin" treehouse gh-axi gh
+  printf '%s\n' "$fakebin"
+}
+
+new_spawn_case() {  # <name> -> prints "<dir>|<home>|<proj>|<wt>|<fakebin>|<id>"
+  local name=$1 dir home proj wt fakebin id
+  dir="$TMP_ROOT/spawn-$name"
+  home="$dir/home"
+  proj="$dir/project"
+  wt="$dir/wt"
+  id="cc-spawn-$name"
+  mkdir -p "$home/data/$id" "$home/projects" "$home/state" "$home/config" "$dir/api"
+  printf 'do the thing\n' > "$home/data/$id/brief.md"
+  fm_git_worktree "$proj" "$wt" "fm/$id"
+  touch "$home/state/.last-watcher-beat"
+  fakebin=$(make_spawn_fakebin "$dir")
+  printf '%s|%s|%s|%s|%s|%s\n' "$dir" "$home" "$proj" "$wt" "$fakebin" "$id"
+}
+
+run_spawn() {  # <dir> <home> <proj> <wt> <fakebin> <id> [spawn args...]
+  local dir=$1 home=$2 proj=$3 wt=$4 fakebin=$5 id=$6
+  shift 6
+  FM_ROOT_OVERRIDE='' FM_HOME="$home" \
+    FM_STATE_OVERRIDE="$home/state" FM_DATA_OVERRIDE="$home/data" \
+    FM_PROJECTS_OVERRIDE="$home/projects" FM_CONFIG_OVERRIDE="$home/config" \
+    FM_SPAWN_NO_GUARD=1 FM_FAKE_PANE_PATH="$wt" TMUX="fake,1,0" \
+    FM_FAKE_TMUX_LOG="$dir/tmux.log" FM_FAKE_CURL_LOG="$dir/curl.log" \
+    PATH="$fakebin:$PATH" \
+    "$ROOT/bin/fm-spawn.sh" "$id" "$proj" cursor-cloud --mode direct-PR --yolo off "$@" 2>&1
+}
+
+test_spawn_launches_the_shim_with_its_own_identity() {
+  local dir home proj wt fakebin id out status launch gen
+  IFS='|' read -r dir home proj wt fakebin id <<EOF
+$(new_spawn_case plain)
+EOF
+  out=$(run_spawn "$dir" "$home" "$proj" "$wt" "$fakebin" "$id" \
+    --model claude-opus-5 --effort high)
+  status=$?
+  expect_code 0 "$status" "a cursor-cloud spawn should succeed: $out"
+  assert_contains "$out" "spawned $id harness=cursor-cloud" 'the spawn must report the harness'
+
+  launch=$(grep -F 'fm-cursor-cloud.sh' "$dir/tmux.log" | head -1)
+  [ -n "$launch" ] || fail "no shim launch command reached the pane: $(cat "$dir/tmux.log")"
+  assert_contains "$launch" 'exec -a cursor-cloud bash ' \
+    'the launch must give the pane process its own argv[0], or a live worker reads as a shell'
+  assert_contains "$launch" "run --id '$id'" 'the shim must be told which task it serves'
+  assert_contains "$launch" "--brief '$home/data/$id/brief.md'" \
+    'the brief must be passed as a path, not typed'
+  assert_contains "$launch" '--worktree ' 'the shim must be told its local copy'
+  assert_contains "$launch" "--model 'claude-opus-5'" 'the model must reach the shim'
+  assert_contains "$launch" "--effort 'high'" 'the effort must reach the shim'
+  assert_not_contains "$launch" '--env-name' 'no environment is pinned without the config file'
+
+  gen=$(sed -n 's/^busy_gen=//p' "$home/state/$id.meta")
+  [ -n "$gen" ] || fail "the busy contract must be armed for a cursor-cloud task: $(cat "$home/state/$id.meta")"
+  assert_contains "$launch" "--busy-gen '$gen'" \
+    'the shim must carry the armed generation so its own lifecycle can write the busy record'
+  assert_line "$home/state/$id.meta" 'harness=cursor-cloud' 'the harness must be recorded'
+  pass 'a cursor-cloud spawn launches the shim with its own pane identity and task wiring'
+}
+
+test_spawn_pins_a_configured_cursor_environment() {
+  local dir home proj wt fakebin id out launch
+  IFS='|' read -r dir home proj wt fakebin id <<EOF
+$(new_spawn_case env)
+EOF
+  printf '# a comment\n\nMy service (cloud agent)\nignored second line\n' \
+    > "$home/config/cursor-cloud-env"
+  out=$(run_spawn "$dir" "$home" "$proj" "$wt" "$fakebin" "$id") \
+    || fail "spawn with a pinned environment failed: $out"
+  launch=$(grep -F 'fm-cursor-cloud.sh' "$dir/tmux.log" | head -1)
+  assert_contains "$launch" "--env-name 'My service (cloud agent)'" \
+    'the configured environment name must reach the shim, quoted'
+  pass 'config/cursor-cloud-env pins the run to a configured Cursor environment'
+}
+
+test_spawn_refuses_a_secondmate() {
+  local dir home proj wt fakebin id out status
+  IFS='|' read -r dir home proj wt fakebin id <<EOF
+$(new_spawn_case secondmate)
+EOF
+  out=$(FM_ROOT_OVERRIDE='' FM_HOME="$home" \
+    FM_STATE_OVERRIDE="$home/state" FM_DATA_OVERRIDE="$home/data" \
+    FM_PROJECTS_OVERRIDE="$home/projects" FM_CONFIG_OVERRIDE="$home/config" \
+    FM_SPAWN_NO_GUARD=1 FM_FAKE_PANE_PATH="$wt" TMUX="fake,1,0" \
+    FM_FAKE_TMUX_LOG="$dir/tmux.log" FM_FAKE_CURL_LOG="$dir/curl.log" \
+    PATH="$fakebin:$PATH" \
+    "$ROOT/bin/fm-spawn.sh" --secondmate "$id" "$dir/nowhere" cursor-cloud 2>&1)
+  status=$?
+  [ "$status" != 0 ] || fail "a cursor-cloud secondmate must be refused: $out"
+  assert_contains "$out" 'crewmate/scout adapter only' \
+    'the refusal must name the crewmate/scout boundary rather than a generic error'
+  pass 'a cursor-cloud secondmate spawn is refused'
+}
+
+test_teardown_cancels_a_still_active_run() {
+  local dir home proj wt fakebin id out
+  IFS='|' read -r dir home proj wt fakebin id <<EOF
+$(new_spawn_case teardown)
+EOF
+  out=$(run_spawn "$dir" "$home" "$proj" "$wt" "$fakebin" "$id") \
+    || fail "spawn before teardown failed: $out"
+  # The shim would normally write this itself; the case stands in for one that
+  # launched a run and then died, which is exactly what teardown backstops.
+  fm_cursor_cloud_record_set "$home/state" "$id" agent=bc-77 run=run-77 status=RUNNING
+  : > "$dir/curl.log"
+
+  out=$(FM_ROOT_OVERRIDE="$ROOT" FM_HOME="$home" FM_STATE_OVERRIDE="$home/state" \
+    FM_DATA_OVERRIDE="$home/data" FM_PROJECTS_OVERRIDE="$home/projects" \
+    FM_CONFIG_OVERRIDE="$home/config" \
+    FM_FAKE_TMUX_LOG="$dir/tmux.log" FM_FAKE_CURL_LOG="$dir/curl.log" \
+    CURSOR_API_KEY=teardown-key FM_CURSOR_CLOUD_CANCEL_WAIT=1 FM_CURSOR_CLOUD_POLL=0.1 \
+    PATH="$fakebin:$PATH" \
+    "$ROOT/bin/fm-teardown.sh" "$id" --force 2>&1) \
+    || fail "teardown failed: $out"
+
+  assert_grep 'agents/bc-77/runs/run-77/cancel' "$dir/curl.log" \
+    'teardown must cancel a still-active cloud run rather than leave it billing'
+  assert_absent "$home/state/$id.cursor-cloud" 'teardown must remove the run record'
+  pass 'teardown cancels a still-active cloud run and removes its record'
+}
+
 test_sse_decode_complete_frames
 test_sse_decode_split_and_partial_frames
 test_sse_decode_types_an_untagged_frame_from_its_payload
@@ -662,3 +828,7 @@ test_api_key_never_reaches_argv_output_or_disk
 test_cancel_subcommand_is_idempotent_and_targeted
 test_shim_pane_process_classifies_as_an_agent
 test_control_tables_declare_cursor_cloud
+test_spawn_launches_the_shim_with_its_own_identity
+test_spawn_pins_a_configured_cursor_environment
+test_spawn_refuses_a_secondmate
+test_teardown_cancels_a_still_active_run
