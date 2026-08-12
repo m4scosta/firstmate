@@ -95,6 +95,8 @@ fi
 . "$SCRIPT_DIR/fm-backend.sh"
 # shellcheck source=bin/fm-control-lib.sh
 . "$SCRIPT_DIR/fm-control-lib.sh"
+# shellcheck source=bin/fm-cursor-cloud-lib.sh
+. "$SCRIPT_DIR/fm-cursor-cloud-lib.sh"
 # shellcheck source=bin/fm-marker-lib.sh
 . "$SCRIPT_DIR/fm-marker-lib.sh"
 # shellcheck source=bin/fm-pending-reply-lib.sh
@@ -479,6 +481,24 @@ else
     else
       send_rc=$?
       verdict=send-failed
+    fi
+  elif [ "$(fm_control_harness_family "$TARGET_HARNESS" 2>/dev/null || true)" = cursor-cloud ]; then
+    # cursor-cloud's pane runs a shim rather than a terminal UI, so it draws no
+    # composer for the shared submit path to read: every composer-shaped verdict
+    # for it would be `unknown` and every genuine delivery would be reported
+    # unconfirmed. Its confirmation is stronger instead of weaker - the shim's own
+    # accepted-input counter advancing proves it read the line - and the owner of
+    # that check is bin/fm-cursor-cloud-lib.sh.
+    CURSOR_CLOUD_ID=
+    [ -z "$TARGET_META" ] || CURSOR_CLOUD_ID=$(fm_send_id_from_meta "$TARGET_META")
+    if [ -z "$CURSOR_CLOUD_ID" ]; then
+      echo "error: task target for $T could not be resolved to a task id, and a cursor-cloud steer is confirmed from that task's own run record; pass the exact task id" >&2
+      exit 1
+    fi
+    if verdict=$(fm_cursor_cloud_submit "$STATE" "$CURSOR_CLOUD_ID" "$TARGET_BACKEND" "$T" "$MESSAGE" "$retries" "$sleep_s"); then
+      :
+    else
+      send_rc=$?
     fi
   elif verdict=$(fm_backend_send_text_submit "$TARGET_BACKEND" "$T" "$MESSAGE" "$retries" "$sleep_s" "$settle" "$EXPECTED_LABEL"); then
     :

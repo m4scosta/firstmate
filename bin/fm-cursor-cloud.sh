@@ -62,6 +62,15 @@ CC_BASE=${FM_CURSOR_CLOUD_BASE:-https://api.cursor.com}
 CC_STREAM_RETRIES=${FM_CURSOR_CLOUD_STREAM_RETRIES:-5}
 CC_CANCEL_WAIT=${FM_CURSOR_CLOUD_CANCEL_WAIT:-20}
 CC_POLL=${FM_CURSOR_CLOUD_POLL:-1}
+# `read -t` takes a WHOLE-SECOND timeout on bash 3.2, the /bin/bash macOS still
+# ships, where a fractional one fails outright rather than degrading - which
+# would spin the wait loop without ever reading its channels. The wait loop
+# therefore rounds up to whole seconds instead of depending on bash 4+, while
+# CC_POLL keeps its exact value for the sleeps that accept a fraction.
+CC_READ_TIMEOUT=$(awk -v p="$CC_POLL" 'BEGIN{t=int(p); if (t < p) t++; if (t < 1) t = 1; print t}')
+# U+001F UNIT SEPARATOR: the one field separator that is not IFS whitespace, so
+# `read` preserves empty fields instead of collapsing a run of them.
+CC_US=$(printf '\037')
 
 usage() {
   sed -n '2,${/^#/!q;p;}' "$0" | sed 's/^# \{0,1\}//'
@@ -175,6 +184,8 @@ RUN_STATUS=
 WORKING_ANNOUNCED=0
 STDIN_OPEN=1
 STDIN_SEQ=0
+STDIN_FAIL_BURST=0
+LOST_CONTACT=0
 STREAM_PID=
 CC_TMP=
 CC_RESP=
@@ -376,25 +387,32 @@ submit_followup() {  # <text>
 # reconcile: read the run's authoritative state. GET .../runs/{runId}, never the
 # stream, decides whether a run is terminal, so a dropped connection can never
 # be reported as a finished or failed run. Prints
-# `<status><TAB><pr-url><TAB><branch><TAB><result-text>`; an unreadable run
-# prints an empty status, which the caller must treat as "still unknown".
+# `<status><US><pr-url><US><branch><US><result-text>` where <US> is U+001F; an
+# unreadable run prints an empty status, which the caller must treat as "still
+# unknown".
+#
+# The separator is deliberately NOT a tab: tab is IFS whitespace, so `read`
+# COLLAPSES runs of it, and a run with no pull request would silently shift its
+# result text into the pull-request field. U+001F is not IFS whitespace, so empty
+# fields survive.
 reconcile() {
   local code
   code=$(cc_api GET "/v1/agents/$AGENT_ID/runs/$RUN_ID") || code=000
   case "$code" in
     2*) ;;
     *)
-      printf '\t\t\t'
+      printf '%s' "$CC_US$CC_US$CC_US"
       return 0
       ;;
   esac
   jq -r --arg repo "$REPO" '
+    def clean: (. // "") | tostring | gsub("[\n\r\t\u001f]"; " ");
     ([.git.branches[]? | select((.repoUrl // $repo) | sub("\\.git$"; "") == $repo)] + [.git.branches[]?])[0] as $b
-    | [ (.status // ""),
-        ($b.prUrl // ""),
-        ($b.branch // ""),
-        ((.result | if type == "string" then . elif type == "object" then (.text // "") else "" end) // "" | gsub("[\\n\\r\\t]"; " "))
-      ] | @tsv' "$CC_RESP" 2>/dev/null || printf '\t\t\t'
+    | [ (.status // "" | clean),
+        ($b.prUrl // "" | clean),
+        ($b.branch // "" | clean),
+        ((.result | if type == "string" then . elif type == "object" then (.text // "") else "" end) | clean)
+      ] | join("\u001f")' "$CC_RESP" 2>/dev/null || printf '%s' "$CC_US$CC_US$CC_US"
 }
 
 # fetch_branch: bring the branch the cloud agent pushed into this task's local
@@ -498,6 +516,7 @@ handle_steer() {  # <line>
       say "cancelling run $RUN_ID"
       outcome=$(cc_cancel_run "$STATE" "$ID")
       say "cancel $outcome"
+      RUN_STATUS=$(fm_cursor_cloud_record_get "$STATE" "$ID" status)
       return 0
       ;;
     '!exit')
@@ -530,7 +549,7 @@ drain_queue() {
 }
 
 run_main() {
-  local kind payload status pr branch text attempts=0 backoff=1 rc
+  local kind payload status pr branch text attempts=0 backoff=1 rc read_started
   require_api_key
   [ -n "$ID" ] || die "--id is required"
   [ -n "$STATE" ] || die "--state is required"
@@ -557,13 +576,47 @@ run_main() {
   launch_run
   start_stream "$FIFO"
   while :; do
-    if IFS=$'\t' read -r -t "$CC_POLL" -u 3 kind payload; then
+    # Steers are read BEFORE stream notifications so a `!cancel` typed into the
+    # pane is acted on promptly rather than behind a whole poll interval.
+    if [ "$STDIN_OPEN" = 1 ]; then
+      # `read`'s own status must be captured directly: a bare `if read ...; then`
+      # whose condition is false leaves $? at the compound statement's own 0, so
+      # reading it afterwards would report success for every timeout.
+      rc=0
+      line=
+      read_started=$SECONDS
+      IFS= read -r -t "$CC_READ_TIMEOUT" line || rc=$?
+      if [ "$rc" -eq 0 ]; then
+        STDIN_FAIL_BURST=0
+        handle_steer "$line"
+        continue
+      fi
+      # A final line with no trailing newline arrives with a failing status.
+      [ -z "$line" ] || handle_steer "$line"
+      # bash 3.2 - the /bin/bash macOS still ships - returns 1 for BOTH a
+      # `read -t` timeout and end of input, so the two are told apart by how long
+      # the read took rather than by its status: a timed-out read consumes its
+      # whole second, while an at-EOF read returns instantly. Two consecutive
+      # instant failures is end of input. Recognizing it is what keeps a pane
+      # whose terminal has gone from spinning this loop at full speed forever;
+      # a live pane's tty never reaches it.
+      if [ "$SECONDS" -eq "$read_started" ]; then
+        STDIN_FAIL_BURST=$((STDIN_FAIL_BURST + 1))
+      else
+        STDIN_FAIL_BURST=0
+      fi
+      if [ "$STDIN_FAIL_BURST" -ge 2 ]; then
+        STDIN_OPEN=0
+        say "input closed"
+      fi
+    fi
+    if IFS=$'\t' read -r -t "$CC_READ_TIMEOUT" -u 3 kind payload; then
       case "$kind" in
         terminal)
           STREAM_PID=
           attempts=0
           backoff=1
-          IFS=$'\t' read -r status pr branch text <<EOF
+          IFS=$CC_US read -r status pr branch text <<EOF
 $(reconcile)
 EOF
           # The stream said terminal; the run endpoint is what confirms it.
@@ -575,7 +628,7 @@ EOF
           ;;
         dropped)
           STREAM_PID=
-          IFS=$'\t' read -r status pr branch text <<EOF
+          IFS=$CC_US read -r status pr branch text <<EOF
 $(reconcile)
 EOF
           if fm_cursor_cloud_status_terminal "$status"; then
@@ -589,6 +642,7 @@ EOF
               busy_apply unknown stream-lost
               status_append "$(fm_cursor_cloud_lost_contact_line "$RUN_ID")"
               RUN_STATUS=${status:-$RUN_STATUS}
+              LOST_CONTACT=1
             else
               say "event stream lost (run reads ${status:-unreadable}); reconnecting in ${backoff}s (attempt $attempts/$CC_STREAM_RETRIES)"
               sleep "$backoff"
@@ -600,21 +654,14 @@ EOF
       esac
       continue
     fi
-    if [ "$STDIN_OPEN" = 1 ]; then
-      if IFS= read -r -t "$CC_POLL" line; then
-        handle_steer "$line"
-        continue
-      fi
-      rc=$?
-      if [ "$rc" -le 128 ]; then
-        STDIN_OPEN=0
-        say "input closed"
-      fi
-    fi
-    # Nothing left to wait for: no live run, no queued steer, no more input.
+    # Nothing left to wait for: no live run to watch, no queued steer, no more
+    # input. A run whose stream could not be re-established counts here too -
+    # its `blocked:` line is already durable, and spinning would report nothing
+    # further - but its status stays non-terminal so the exit path still cancels
+    # it rather than leaving it running and billing.
     if [ "$STDIN_OPEN" = 0 ] && [ -z "$STREAM_PID" ] \
        && [ -z "$STEER_QUEUE" ] \
-       && fm_cursor_cloud_status_terminal "$RUN_STATUS"; then
+       && { fm_cursor_cloud_status_terminal "$RUN_STATUS" || [ "$LOST_CONTACT" = 1 ]; }; then
       return 0
     fi
   done

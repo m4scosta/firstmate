@@ -34,6 +34,12 @@
 #   codex-hook, codex-appserver  reserved: Codex, gated by
 #                    fm_busy_codex_semantic_source
 #   kimi-wire, kimi-hook  reserved: standalone Kimi, gated by fm_busy_kimi_verified
+#   cursor-cloud-shim  the cursor-cloud pane shim's own cloud-run lifecycle
+#                    (bin/fm-cursor-cloud.sh): busy when a run is created, idle
+#                    when it reaches a terminal state, unknown when its event
+#                    stream could not be re-established. It is the one source
+#                    that needs no vendor-verification gate, because the writer
+#                    is firstmate's own process rather than a harness hook.
 # Firstmate-owned sources accepted for every converted adapter:
 #   fm-spawn         the launch-brief turn seeded at spawn
 #   fm-interrupt     the legacy Claude fm-send --key Escape idle event
@@ -188,6 +194,7 @@ fm_busy_sources_for_harness() {  # <harness>
       fm_busy_kimi_verified || { printf ''; return 0; }
       adapter='kimi-wire kimi-hook'
       ;;
+    cursor-cloud*) adapter=cursor-cloud-shim ;;
     *) printf ''; return 0 ;;
   esac
   printf '%s fm-spawn fm-interrupt fm-recovery' "$adapter"

@@ -1035,7 +1035,7 @@ if [ "$RELAUNCH" -eq 1 ]; then
   }
 elif [ "$KIND" = secondmate ]; then
   case "${POS[1]:-}" in
-    ''|claude|codex|opencode|pi|pi-signed|grok|kimi|muse)
+    ''|claude|codex|opencode|pi|pi-signed|grok|kimi|muse|cursor-cloud)
       ARG3=${POS[1]:-}
       ;;
     *' '*)
@@ -1151,6 +1151,21 @@ launch_template() {
     # session event log instead (bin/fm-busy-lib.sh), bound by the sidecar
     # written below. Nothing to place in the template for it.
     # codex, opencode, and kimi are also markerless and share this inherited-marker hazard; changing their verified launch boundaries belongs in follow-up work.
+    # cursor-cloud: the pane runs firstmate's own shim rather than a terminal UI,
+    # because the work happens in Cursor's cloud over its Agents REST API
+    # (bin/fm-cursor-cloud.sh, docs/cursor-cloud-backend.md). Three parts of this
+    # line are load-bearing.
+    #   `exec -a cursor-cloud bash <script>` is what makes the pane process
+    #   IDENTIFIABLE: a `#!` script's own name never reaches argv[0], because the
+    #   kernel replaces it with the interpreter, so without the explicit argv[0]
+    #   the pane would read as a bare shell and the liveness classifier in
+    #   bin/backends/tmux.sh would call a live worker dead.
+    #   The brief is passed as a PATH rather than through the operational-input
+    #   encoder: the shim reads the file itself and sends its text as the cloud
+    #   run's prompt, so there is no composer to paste it into.
+    #   The busy generation is passed in so the shim's own run lifecycle can write
+    #   the semantic busy record (bin/fm-busy-lib.sh's cursor-cloud-shim source).
+    cursor-cloud) printf '%s' 'exec -a cursor-cloud bash __CURSORCLOUD__ run --id __TASKID__ --state __STATEDIR__ --worktree __WORKTREE__ --brief __BRIEF__ --busy-gen __BUSYGEN__ __CCENVFLAG____MODELFLAG____EFFORTFLAG__' ;;
     muse) printf '%s' 'env -u CLAUDECODE -u PI_CODING_AGENT -u GROK_AGENT -u FM_PI_HARNESS XDG_CONFIG_HOME=__MUSECONFIG__ XDG_DATA_HOME=__MUSEDATA__ MUSE_EXPERIMENTAL_FOREIGN_PERSONAL_CONTEXT_KILL=on __MUSEBIN__ --yolo __MODELFLAG____EFFORTFLAG__"$(__OPINPUT__ encode launch-brief < __BRIEF__)"' ;;
     *) return 1 ;;
   esac
@@ -1215,6 +1230,15 @@ esac
 # secondmate whose supervision cycle could never be armed.
 if [ "$KIND" = secondmate ] && [ "$HARNESS" = muse ]; then
   echo "error: muse is a verified crewmate/scout adapter only and cannot run a secondmate; it has no primary supervision protocol. Select a harness verified for secondmates." >&2
+  exit 1
+fi
+
+# cursor-cloud is a crewmate/scout adapter only for a more basic reason than
+# muse's: its pane runs a shim that executes ONE cloud task and exits, not a
+# firstmate instance. A secondmate has to hold a session lock, supervise its own
+# fleet, and answer routed work, none of which a cloud run can do.
+if [ "$KIND" = secondmate ] && [ "$HARNESS" = cursor-cloud ]; then
+  echo "error: cursor-cloud is a crewmate/scout adapter only and cannot run a secondmate; its pane runs a single cloud task rather than a firstmate instance. Select a harness verified for secondmates." >&2
   exit 1
 fi
 
@@ -1321,7 +1345,7 @@ model_flag_for_harness() {
   local harness=$1 model=$2
   [ -n "$model" ] && [ "$model" != default ] || return 0
   case "$harness" in
-    claude|codex|opencode|pi|pi-signed|grok|kimi|muse)
+    claude|codex|opencode|pi|pi-signed|grok|kimi|muse|cursor-cloud)
       printf -- '--model %s ' "$(shell_quote "$model")"
       ;;
   esac
@@ -1372,6 +1396,16 @@ effort_flag_for_harness() {
       case "$effort" in
         low|medium|high|xhigh) printf -- '--reasoning-effort %s ' "$(shell_quote "$effort")" ;;
         max) printf -- '--reasoning-effort %s ' "$(shell_quote ultra)" ;;
+      esac
+      ;;
+    cursor-cloud)
+      # Cursor expresses reasoning effort as a MODEL PARAMETER, not a flag, and
+      # which parameter carries it differs by model family. The shim resolves
+      # that from Cursor's own model catalog at launch and drops a level the
+      # chosen model does not accept, so the whole shared vocabulary is passed
+      # through here rather than filtered against a table that would rot.
+      case "$effort" in
+        low|medium|high|xhigh|max) printf -- '--effort %s ' "$(shell_quote "$effort")" ;;
       esac
       ;;
     # opencode's interactive `opencode --prompt` launch has a verified --model
@@ -2277,7 +2311,11 @@ if [ "$KIND" != secondmate ]; then
       ;;
   esac
   case "$HARNESS" in
-    claude*|opencode*|pi|pi-signed)
+    # cursor-cloud arms like the other converted adapters: its writer is
+    # firstmate's own shim, which applies busy on every run it creates and idle
+    # on every terminal state, so a seeded record always has something that can
+    # clear it.
+    claude*|opencode*|pi|pi-signed|cursor-cloud*)
       BUSY_GEN=$("$FM_ROOT/bin/fm-busy-event.sh" arm "$STATE_REAL" "$ID") || {
         echo "error: failed to arm the busy-state contract for $ID" >&2
         exit 1
@@ -2656,6 +2694,26 @@ LAUNCH=${LAUNCH//__PIEXT__/$sq_piext}
 LAUNCH=${LAUNCH//__PITURNEND__/$sq_piturnend}
 LAUNCH=${LAUNCH//__PIWATCH__/$sq_piwatch}
 LAUNCH=${LAUNCH//__OPINPUT__/$sq_opinput}
+case "$HARNESS" in
+  cursor-cloud*)
+    # config/cursor-cloud-env pins the run to an already-configured Cursor
+    # environment instead of the default cloud pool; absent means the default
+    # (docs/configuration.md "Cursor cloud environment").
+    CC_ENV_NAME=
+    if [ -f "$CONFIG/cursor-cloud-env" ]; then
+      CC_ENV_NAME=$(sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//' "$CONFIG/cursor-cloud-env" \
+        | grep -v '^#' | grep -v '^$' | head -1 || true)
+    fi
+    CC_ENV_FLAG=
+    [ -z "$CC_ENV_NAME" ] || CC_ENV_FLAG="--env-name $(shell_quote "$CC_ENV_NAME") "
+    LAUNCH=${LAUNCH//__CURSORCLOUD__/"$(shell_quote "$FM_ROOT/bin/fm-cursor-cloud.sh")"}
+    LAUNCH=${LAUNCH//__TASKID__/"$(shell_quote "$ID")"}
+    LAUNCH=${LAUNCH//__STATEDIR__/"$(shell_quote "$STATE_REAL")"}
+    LAUNCH=${LAUNCH//__WORKTREE__/"$(shell_quote "$WT")"}
+    LAUNCH=${LAUNCH//__BUSYGEN__/"$(shell_quote "${BUSY_GEN:-}")"}
+    LAUNCH=${LAUNCH//__CCENVFLAG__/$CC_ENV_FLAG}
+    ;;
+esac
 case "$HARNESS" in
   pi|pi-signed) LAUNCH=${LAUNCH//__PIBIN__/"$(shell_quote "$PI_BIN")"} ;;
 esac

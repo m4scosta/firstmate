@@ -237,15 +237,23 @@ fm_cursor_cloud_sse_decode() {
 # Prints the same vocabulary the composer path prints, so callers need no new
 # verdict handling: `empty` for a confirmed delivery, `pending` when the counter
 # never advanced, and `send-failed` when the text could not be typed at all.
+#
+# Typing still goes through the backend's own verified submit primitive, so each
+# session provider keeps owning how bytes and Enter reach its pane; only the
+# VERDICT is replaced. Its composer-shaped answer is discarded rather than
+# trusted, and an extra Enter it may send while chasing that answer is harmless
+# here: the shim ignores an empty input line without counting it.
 # Requires bin/fm-backend.sh to be sourced already.
 fm_cursor_cloud_submit() {  # <state-dir> <id> <backend> <target> <text> <retries> <sleep>
   local state=$1 id=$2 backend=$3 target=$4 text=$5 retries=${6:-3} sleep_s=${7:-0.4}
-  local before after i=0
+  local before after i=0 typed
   before=$(fm_cursor_cloud_record_get "$state" "$id" stdin_seq)
   case "$before" in
     ''|*[!0-9]*) before=0 ;;
   esac
-  fm_backend_send_text_line "$backend" "$target" "$text" || { printf 'send-failed'; return 0; }
+  typed=$(fm_backend_send_text_submit "$backend" "$target" "$text" "$retries" "$sleep_s" 0.3) \
+    || { printf 'send-failed'; return 0; }
+  [ "$typed" != send-failed ] || { printf 'send-failed'; return 0; }
   while [ "$i" -lt "$retries" ]; do
     sleep "$sleep_s"
     after=$(fm_cursor_cloud_record_get "$state" "$id" stdin_seq)

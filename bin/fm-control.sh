@@ -130,6 +130,8 @@ DATA="${FM_DATA_OVERRIDE:-$FM_HOME/data}"
 . "$SCRIPT_DIR/fm-busy-lib.sh"
 # shellcheck source=bin/fm-control-lib.sh
 . "$SCRIPT_DIR/fm-control-lib.sh"
+# shellcheck source=bin/fm-cursor-cloud-lib.sh
+. "$SCRIPT_DIR/fm-cursor-cloud-lib.sh"
 # shellcheck source=bin/fm-pr-lib.sh
 . "$SCRIPT_DIR/fm-pr-lib.sh"
 # shellcheck source=bin/fm-wake-lib.sh
@@ -359,6 +361,22 @@ send_interrupt_keys() {
     || die "interrupt key $key reached task $ID, but $clear did not, so its composer still holds the cancelled prompt; clear it before the next lifecycle action"
 }
 
+# deliver_interrupt_api: the `api` interrupt transport. cursor-cloud's running
+# turn is a cloud run, so it is cancelled through the Cursor API rather than by a
+# key press into a pane that has no composer. The shim's own cancel path is the
+# single owner of the request and of confirming the run's terminal state from
+# GET /v1/agents/{id}/runs/{runId} (bin/fm-cursor-cloud.sh).
+CURSOR_CLOUD_CANCEL_OUTCOME=
+deliver_interrupt_api() {
+  case "$HARNESS" in
+    cursor-cloud) ;;
+    *) die "harness $HARNESS declares the api interrupt transport but fm-control has no implementation for it; refusing to guess" ;;
+  esac
+  CURSOR_CLOUD_CANCEL_OUTCOME=$("$SCRIPT_DIR/fm-cursor-cloud.sh" cancel "$STATE" "$ID") \
+    || die "the cloud run for task $ID could not be cancelled; its work may still be running and billing"
+  CURSOR_CLOUD_CANCEL_OUTCOME=$(printf '%s' "$CURSOR_CLOUD_CANCEL_OUTCOME" | tr -d '[:space:]')
+}
+
 prepare_interrupt_ack() {
   INTERRUPT_ACK_SOURCE=$(fm_control_interrupt_ack_source "$HARNESS")
   INTERRUPT_ACK_LOG=
@@ -374,6 +392,17 @@ prepare_interrupt_ack() {
 
 interrupt_cancel_claim() {
   local elapsed=0 terminal=
+  # cursor-cloud's acknowledgement is already settled by the time the transport
+  # returns: its cancel path polls the run endpoint, so only a run confirmed
+  # terminal counts as a cancelled turn. An already-terminal or unreadable run is
+  # reported unconfirmed rather than claimed as this action's own work.
+  if [ "$INTERRUPT_ACK_SOURCE" = cursor-cloud-run-terminal ]; then
+    case "$CURSOR_CLOUD_CANCEL_OUTCOME" in
+      cancelled) printf 'confirmed' ;;
+      *) printf 'unconfirmed' ;;
+    esac
+    return 0
+  fi
   case "$INTERRUPT_ACK_SOURCE:$INTERRUPT_ACK_RUN" in
     muse-session-terminal:?*) ;;
     *) printf 'unconfirmed'; return 0 ;;
@@ -394,9 +423,15 @@ interrupt_cancel_claim() {
 # deliver_interrupt: deliver and observe the strongest adapter-owned
 # cancellation claim available after delivery.
 deliver_interrupt() {
-  local cancel
+  local cancel transport
+  transport=$(fm_control_interrupt_transport "$HARNESS") \
+    || die "task $ID records harness '$HARNESS', whose interrupt transport is unknown; fm-control refuses to guess between a key press and an API call"
   prepare_interrupt_ack
-  send_interrupt_keys
+  if [ "$transport" = api ]; then
+    deliver_interrupt_api
+  else
+    send_interrupt_keys
+  fi
   cancel=$(interrupt_cancel_claim)
   printf '%s' "$cancel"
 }

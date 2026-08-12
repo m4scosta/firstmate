@@ -168,6 +168,15 @@ fm_backend_tmux_classify_process_name() {  # <path> [argv0] -> agent|shell|other
     # cannot carry it either: ~/.local/bin/muse-bin-<version> has no `muse` path
     # COMPONENT, so the fm_harness_path_name fallback below never fires for it.
     muse|muse-bin-*) printf 'agent' ;;
+    # cursor-cloud's pane process is firstmate's OWN shim, launched with an
+    # explicit argv[0] of `cursor-cloud` (bin/fm-spawn.sh's launch template).
+    # That indirection is necessary rather than decorative: a `#!` script's name
+    # never survives into argv[0], because the kernel replaces it with the
+    # interpreter, so the pane would otherwise report `bash` and a live worker
+    # would classify `dead` - the one verdict that can launch a duplicate agent
+    # onto a live worktree. Anchored, never globbed, because this name is
+    # firstmate's own choice and needs no fuzzy matching.
+    cursor-cloud) printf 'agent' ;;
     *claude*|*codex*|*opencode*|*grok*|*kimi*|pi|pi-signed|pi-launcher|Pi) printf 'agent' ;;
     zsh|bash|sh|dash|ash|ksh|mksh|tcsh|csh|fish) printf 'shell' ;;
     *)

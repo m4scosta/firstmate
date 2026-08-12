@@ -655,6 +655,31 @@ remove_grok_turnend_auth() {
   rm -f -- "$path"
 }
 
+# cancel_cursor_cloud_run: a cursor-cloud task's work runs in Cursor's cloud and
+# bills until it stops, so teardown must not leave one running with nothing left
+# to consume it. The shim cancels its own run when it exits, and this is the
+# independent backstop for the case where the shim is already gone. It runs only
+# once teardown is committed - after every landed-work and endpoint check has
+# passed - because cancelling a run for a teardown that is then refused would
+# destroy work the task still owns. An unconfirmed cancel is reported loudly
+# rather than swallowed: an orphaned run keeps costing money.
+cancel_cursor_cloud_run() {  # <state-dir> <id> <recorded-harness>
+  local state=$1 id=$2 harness=$3 family outcome
+  family=$(fm_control_harness_family "$harness" 2>/dev/null) || return 0
+  [ "$family" = cursor-cloud ] || return 0
+  [ -f "$state/$id.cursor-cloud" ] || return 0
+  outcome=$("$FM_ROOT/bin/fm-cursor-cloud.sh" cancel "$state" "$id" 2>&1) || outcome="failed: $outcome"
+  outcome=$(printf '%s' "$outcome" | tr '\n' ' ')
+  case "$outcome" in
+    *cancelled*|*already-terminal*|*none*)
+      echo "teardown $id: cursor cloud run cancel=$outcome" >&2
+      ;;
+    *)
+      echo "warning: teardown $id could not confirm its cursor cloud run stopped ($outcome); open https://cursor.com/agents and stop it there so it does not keep running and billing" >&2
+      ;;
+  esac
+}
+
 remove_kimi_turnend_auth() {
   local state_dir=$1 id=$2 token_path token='' path
   token_path=$(fm_control_harness_turnend_token_path kimi "$state_dir" "$id") || return 1
@@ -2527,6 +2552,7 @@ if [ "$KIND" = secondmate ]; then
 fi
 remove_grok_turnend_auth "$STATE" "$ID" || exit 1
 remove_kimi_turnend_auth "$STATE" "$ID" || exit 1
+cancel_cursor_cloud_run "$STATE" "$ID" "$(meta_value "$META" harness)"
 fm_backend_clear_transition "$BACKEND" "$STATE" "$T" || true
 # Remove the per-task temp root (/tmp/fm-<id>/, incl. its gotmp/) recorded by spawn.
 # Read before the state-file rm below; empty (pre-fix tasks without tasktmp=) is a no-op.
@@ -2536,7 +2562,7 @@ retire_busy_state "$STATE" "$ID" "$BUSY_GEN" || exit 1
 rm -f "$STATE/$ID.status" "$STATE/$ID.turn-ended" "$STATE/$ID.meta" \
   "$STATE/$ID.pi-ext.ts" "$STATE/$ID.grok-turnend-token" \
   "$STATE/$ID.kimi-turnend-token" "$STATE/$ID.muse-session" \
-  "$STATE/$ID.muse-session-current" \
+  "$STATE/$ID.muse-session-current" "$STATE/$ID.cursor-cloud" \
   "$STATE/.$ID.open-decisions-cursor" \
   "$STATE/$ID.control-relaunch" "$STATE/$ID.control-relaunch.meta-prior" \
   "$STATE/$ID.control-relaunch.brief-prior" "$STATE/$ID.control-relaunch.note"
