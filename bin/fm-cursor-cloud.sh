@@ -462,11 +462,14 @@ stream_run() {  # <fifo>
     "$CC_BASE/v1/agents/$AGENT_ID/runs/$RUN_ID/stream" 2>/dev/null \
     | fm_cursor_cloud_sse_decode \
     | { while IFS=$'\t' read -r type data; do
-        # Close an open delta line before any event that is not more of it.
+        # Close an open delta line only before an event that actually PRINTS
+        # something. A blanket close was wrong: the live stream interleaves frames
+        # this renderer shows nothing for, and closing on those reopened the prefix
+        # on every single token, which is the fragmenting this coalescing exists to
+        # stop.
         if [ -n "$open" ]; then
           case "$type" in
-            assistant|thinking) ;;
-            *) printf '\n'; open= ;;
+            status|tool_call|result|error) printf '\n'; open= ;;
           esac
         fi
         case "$type" in

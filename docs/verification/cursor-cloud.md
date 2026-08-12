@@ -8,12 +8,12 @@ Active empirical evidence for firstmate's `cursor-cloud` adapter.
 | Field | Value |
 |---|---|
 | Surface | Cursor Agents REST API, base `https://api.cursor.com` |
-| Verified | 2026-08-12, including a live plan-mode run |
+| Verified | 2026-08-12, including a live plan-mode run and one live agent-mode run that opened a pull request |
 | Platform | macOS arm64 (Darwin 25.5.0), `curl` 8.x, `jq` 1.7.1 |
 | Auth | HTTP basic, `CURSOR_API_KEY` as username with an empty password |
 
 Every probe in the sections before "Live plan-mode run" is a READ, so none of it launched an agent or incurred run cost; `GET /v1/agents` and `GET /v1/models` are therefore the safe refresh commands.
-That one live run is the exception and is scoped accordingly: plan mode, no pull request, one captain-approved repository.
+The two live runs are the exception and were scoped accordingly: one captain-approved repository, a read-only plan-mode run, and one agent-mode run whose whole approved diff was a single line.
 Response bodies are quoted with account-identifying values removed and long arrays truncated where marked.
 
 ## Auth reaches the account
@@ -137,10 +137,46 @@ Three shapes in that output differ from what the documented examples suggest, an
 
 A plan-mode run still reported a `git.branches[]` entry with a branch name and no `prUrl`, which is why a `FINISHED` run without a pull request has its own status line rather than being treated as an error.
 
+## Live agent-mode run with a pull request
+
+One captain-approved agent-mode run against the same repository, launched with `autoCreatePR: true` and a prompt whose whole approved change was one line in one file.
+It finished in 267557 ms and the pull request URL arrived exactly where the mapping expects it:
+
+```
+[cursor-cloud] result FINISHED
+[cursor-cloud] PR https://github.com/Faire/backend/pull/289204
+[cursor-cloud] status: done: PR https://github.com/Faire/backend/pull/289204
+```
+
+```
+$ curl -sS -u "$CURSOR_API_KEY": .../runs/run-d4b2ef76-... | jq -c '{status, durationMs, pr: .git.branches[0].prUrl}'
+{"status":"FINISHED","durationMs":267557,"pr":"https://github.com/Faire/backend/pull/289204"}
+```
+
+This run also delivered 24 live `tool_call` frames, which the plan-mode run never produced, so that renderer is live-verified too.
+
+It exposed one renderer defect worth keeping recorded, because the obvious fix is the wrong one.
+The first delta-coalescing attempt closed the open line before ANY non-delta event.
+The live stream interleaves frames this renderer prints nothing for, so that blanket close fired between consecutive tokens and re-printed the prefix on every single one - the exact fragmenting the coalescing exists to stop.
+The line is now closed only before an event that actually prints something (`status`, `tool_call`, `result`, `error`), and `tests/fm-cursor-cloud.test.sh` drives a silent frame between two deltas so the regression cannot come back.
+
+## Agent status is not run status
+
+`GET /v1/agents` and `GET /v1/agents/{id}` report an AGENT-level `status` from a different vocabulary than a run's: `ACTIVE` or `ARCHIVED`, describing the agent record rather than any work in progress.
+
+```
+$ curl -sS -u "$CURSOR_API_KEY": https://api.cursor.com/v1/agents/bc-64b06942-... | jq -c '{status, latestRunId}'
+{"status":"ACTIVE","latestRunId":"run-d4b2ef76-..."}
+```
+
+That agent read `ACTIVE` while its only run was already `FINISHED`, so an agent reading `ACTIVE` is NOT evidence of a run still consuming resources, and cancelling on that basis would destroy finished work.
+Nothing in the adapter reads agent-level status: every liveness and cancellation decision reads the RUN status recorded for the task.
+
+The same call also shows the agent list is ACCOUNT-WIDE, returning agents this fleet never launched, which is the second reason firstmate must never enumerate-and-act: the task's own run record binds exactly one agent and one run, and that binding is the only thing teardown or a cancel ever addresses.
+
 ## What is not verified here
 
-- No live `tool_call` event was observed: the plan-mode run reached its answer without one. That renderer is covered only by `tests/fm-cursor-cloud.test.sh`.
-- No live `error` frame was observed, so that renderer is likewise test-covered only.
+- No live `error` frame was observed, so that renderer is test-covered only.
 - The `env` object's accepted `type` values are taken from Cursor's documentation; only the `cloud` form is used, and only when `config/cursor-cloud-env` names an environment. The live run passed no `env` and the cloud agent resolved the repository's own environment on its own.
 - The dropped-stream reconnect path was not forced live; it is pinned by `tests/fm-cursor-cloud.test.sh`, which drives a stream that ends without a terminal event, a run endpoint that still reads `RUNNING`, and an exhausted retry budget.
 
@@ -148,6 +184,7 @@ A plan-mode run still reported a `git.branches[]` entry with a branch name and n
 
 ```sh
 curl -sS -u "$CURSOR_API_KEY": https://api.cursor.com/v1/agents | jq 'keys'
+curl -sS -u "$CURSOR_API_KEY": https://api.cursor.com/v1/agents/<agent-id>/runs/<run-id> | jq -c '{status, git}'
 curl -sS -u "$CURSOR_API_KEY": https://api.cursor.com/v1/models | jq -r '.items[] | "\(.id)\t\([.parameters[]?.id]|join(","))"'
 bash tests/fm-cursor-cloud.test.sh
 ```

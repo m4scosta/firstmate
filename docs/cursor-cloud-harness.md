@@ -86,6 +86,10 @@ Two independent paths prevent one:
 
 Watch runs and costs at <https://cursor.com/agents>.
 
+Two facts about that console are worth knowing before reading it as fleet state.
+An agent's own `ACTIVE`/`ARCHIVED` status describes the agent record, not whether a run is consuming anything - an agent reads `ACTIVE` long after its only run finished - and the agent list is account-wide, including agents this fleet never launched.
+Firstmate never enumerates that list or acts on an agent-level status: each task's own record binds exactly one agent and one run, and that binding is the only thing a cancel ever addresses.
+
 ## Status lines
 
 The shim appends to the task's status file sparsely: one line when the run starts, and one when it reaches a terminal state.

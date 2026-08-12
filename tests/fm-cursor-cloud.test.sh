@@ -265,8 +265,14 @@ EOF
   {
     sse_frame status '{"runId":"run-aaaa","status":"RUNNING"}'
     sse_frame assistant '{"text":"working"}'
+    # The live stream interleaves frames this renderer prints nothing for; one
+    # sits between these deltas so the case proves a silent frame does not break
+    # the coalescing, which is exactly how the first fix failed live.
+    sse_frame heartbeat '{"seq":1}'
     sse_frame assistant '{"text":" on"}'
     sse_frame assistant '{"text":" it"}'
+    sse_frame tool_call '{"callId":"c1","name":"bash","status":"completed"}'
+    sse_frame assistant '{"text":"second thought"}'
     sse_frame result '{"runId":"run-aaaa","status":"FINISHED"}'
     sse_frame 'done' '{}'
   } > "$dir/api/stream.1"
@@ -291,8 +297,10 @@ JSON
   rec=$(fm_cursor_cloud_record_get "$home/state" "$id" agent)
   [ "$rec" = bc-1111 ] || fail "the run record must record the agent id, got '$rec'"
   assert_contains "$out" 'assistant: working on it' 'stream events are rendered into the pane'
-  [ "$(printf '%s\n' "$out" | grep -c 'assistant: ')" = 1 ] \
-    || fail "consecutive assistant deltas must coalesce onto one pane line, got: $out"
+  assert_contains "$out" 'tool bash (completed)' 'a tool call is rendered'
+  assert_contains "$out" 'assistant: second thought' 'a rendering event opens the next delta line'
+  [ "$(printf '%s\n' "$out" | grep -c 'assistant: ')" = 2 ] \
+    || fail "deltas must coalesce into one line per uninterrupted run, got: $out"
   assert_line "$dir/api/call.log" 'POST https://api.cursor.com/v1/agents' \
     'the launch is a POST to /v1/agents'
   assert_line "$dir/api/call.log" 'GET https://api.cursor.com/v1/agents/bc-1111/runs/run-aaaa' \
