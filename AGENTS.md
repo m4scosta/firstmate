@@ -67,6 +67,7 @@ bin/                 helper scripts, committed; read each script's header before
 config/crew-harness  crewmate harness override; LOCAL, gitignored; absent or "default" = same as firstmate. Inherited as the literal file: a concrete primary adapter value also controls a secondmate home's own crewmates (section 4)
 config/crew-dispatch.json  optional crewmate dispatch profiles; LOCAL, gitignored; firstmate-maintained but human-editable natural-language rules that choose a per-task harness/model/effort profile (section 4). Inherited by secondmate homes
 config/secondmate-harness  harness the PRIMARY uses to launch SECONDMATE agents, optionally followed by a model and effort token on the same line ("<harness> [<model>] [<effort>]"; section 4); LOCAL, gitignored; absent or "default" harness falls back to config/crew-harness then firstmate's own. The primary's own setting; NOT inherited into secondmate homes (secondmates do not spawn secondmates)
+config/cursor-cloud-env  optional Cursor environment name pinning cursor-cloud runs to an already-configured environment instead of the default cloud pool; LOCAL, gitignored; inherited by secondmate homes; see docs/cursor-cloud-harness.md
 config/backlog-backend  backlog backend override; LOCAL, gitignored; absent or "tasks-axi" = default tasks-axi backend, "manual" = force routine backlog updates to hand-editing; inherited by secondmate homes (section 10)
 config/backend  runtime session-provider backend override for new tasks; LOCAL, gitignored; absent = falls through to runtime auto-detection (the runtime firstmate itself is executing inside), then tmux; tmux is the verified reference backend (docs/tmux-backend.md), while herdr, zellij, orca, and cmux are experimental spawn backends (docs/herdr-backend.md, docs/zellij-backend.md, docs/orca-backend.md, docs/cmux-backend.md) - herdr and cmux can also be selected by runtime auto-detection, zellij and orca never are (always explicit), and codex-app is not accepted; see docs/codex-app-backend.md; inherited by secondmate homes under the primary-authoritative contract in secondmate-provisioning
 config/calm     Pi Calm presentation preference; LOCAL, gitignored, and not inherited; see docs/configuration.md "Pi Calm preference"
@@ -92,6 +93,7 @@ state/               runtime records and signals; gitignored
   <id>.grok-turnend-token   firstmate-owned grok hook registry token for the task; removed by teardown
   <id>.kimi-turnend-token   firstmate-owned Kimi hook registry token for the task; removed by teardown
   <id>.muse-session  muse busy-source binding (sessions root plus task worktree) written by fm-spawn; removed by teardown
+  <id>.cursor-cloud  cursor-cloud run record (agent, run, status, accepted-input counter) written by the pane shim; what lets teardown cancel a still-active cloud run; bin/fm-cursor-cloud-lib.sh
   <id>.meta          task metadata; each producer script's header owns its exact fields and mutation contract, with docs/configuration.md routing operator-facing backend and trace-context details
   <id>.herdr-presentation  quarantinable attempt and restart-binding journal for Herdr's optional visual projection; never task or endpoint authority; see docs/herdr-backend.md "Presentation spaces"
   <id>.check.sh      authenticated slow poll; the watcher dispatches validated PR data and the byte-identified Relay shim through trusted repository scripts, runs registered custom checks from hash-validated private snapshots, and rejects every other state check without execution
@@ -178,7 +180,8 @@ A silent bootstrap section needs no action; for any printed actionable diagnosti
 ## 4. Harness and runtime dispatch
 
 Load `harness-adapters` before every spawn or recovery and before trust handling, skill invocation, interrupt, exit, resume, or adapter verification.
-The verified harnesses are `claude`, `codex`, `opencode`, `pi`, `pi-signed`, `grok`, and `kimi`, plus `muse` for crewmates and scouts only; never dispatch on an unverified adapter.
+The verified harnesses are `claude`, `codex`, `opencode`, `pi`, `pi-signed`, `grok`, and `kimi`, plus `muse` and `cursor-cloud` for crewmates and scouts only; never dispatch on an unverified adapter.
+A `cursor-cloud` ship task is `direct-PR` only, because its work runs as a Cursor Cloud Agent where the no-mistakes pipeline cannot run; `harness-adapters` owns the rest.
 If static `config/crew-harness` or `config/secondmate-harness` names an unverified adapter, report it and fall back only to a verified adapter rather than launching it.
 
 `docs/configuration.md` owns dispatch-profile and runtime-backend schemas, `bin/fm-harness.sh` owns static resolution, and `bin/fm-spawn.sh` owns launch flags and fail-closed validation.
@@ -276,6 +279,7 @@ Load `diagnostic-reasoning` before scoping a reported bug and before acting on a
 Resolve every ship task's concrete delivery mode and yolo posture at intake, and pass both explicitly to the brief, the spawn, and any scout promotion, which all refuse to guess.
 A current explicit captain instruction wins; otherwise the project's registry entry is the captain's standing posture, and dropping below its rigor needs a reason you can state.
 On a `no-mistakes-prod-only` project, classify the task's surface: internal-only tooling, automation, contributor or operator process, and release or submission work ships `direct-PR`, while product-facing, mixed, and uncertain work ships `no-mistakes`; never infer internal-only from file location or project name.
+A `cursor-cloud` task resolves to `direct-PR` regardless of the project's standing posture, because no-mistakes cannot run inside a cloud agent; if the work needs that pipeline, dispatch it on a local harness instead.
 An unregistered project or absent registry resolves to `no-mistakes` with yolo off, and the registration gap goes to the captain.
 Record the resulting mode, yolo, and the one-line reason for any deviation in the backlog item note.
 

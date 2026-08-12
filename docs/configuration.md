@@ -95,6 +95,14 @@ The caller-facing label remains `fm-<id>`, but the actual cmux workspace title i
 Test cleanup must use the guarded path in [`docs/cmux-backend.md`](cmux-backend.md#current-operation-and-safety), never enumerate-and-close every workspace.
 `config/backend` is inherited into secondmate homes under the primary-authoritative contract owned by [`secondmate-provisioning`](../.agents/skills/secondmate-provisioning/SKILL.md).
 
+## Cursor cloud environment (config/cursor-cloud-env)
+
+`config/cursor-cloud-env` is an optional local, gitignored file holding one line: the `name` of an already-configured Cursor environment that `cursor-cloud` runs should be pinned to instead of Cursor's default cloud environment.
+Blank lines and `#` comments are ignored and the first remaining line wins.
+When the file is absent, no `env` object is sent, so a repository carrying its own `.cursor/environment.json` is picked up by the cloud agent on its own.
+`bin/fm-spawn.sh` reads it at every spawn and passes the resolved name to the shim, so a change takes effect on the next spawn or control-plane relaunch.
+It is inherited by secondmate homes like the other local operating choices, and [`cursor-cloud-harness.md`](cursor-cloud-harness.md) owns the rest of that harness's setup.
+
 ## Away-mode supervisor backend (FM_SUPERVISOR_BACKEND / FM_SUPERVISOR_TARGET)
 
 The `/afk` sub-supervisor injects escalation digests into firstmate's own pane independently of where new task endpoints are spawned.
@@ -208,6 +216,8 @@ The full cmux home label also includes a short hash of the resolved `FM_ROOT` pa
 
 claude, codex, opencode, pi, pi-signed, grok, and kimi are empirically verified for crewmate and secondmate launches; [README requirements](../README.md#requirements) own the set supported for the primary session.
 muse is verified for crewmate and scout launches ONLY, and `fm-spawn.sh` refuses it for a secondmate, because muse ships no usable hook surface for a primary session's turn-end supervision; [`docs/verification/muse.md`](verification/muse.md) owns that evidence.
+cursor-cloud is likewise verified for crewmate and scout launches only: its pane runs a Firstmate shim driving a Cursor Cloud Agent rather than a local agent, so it can never be a firstmate instance, and its ship tasks are `direct-PR` only because Firstmate's validation pipeline cannot run inside a cloud agent.
+It needs `CURSOR_API_KEY` in the environment the session provider's daemon inherits; [`cursor-cloud-harness.md`](cursor-cloud-harness.md) owns its setup and limits and [`docs/verification/cursor-cloud.md`](verification/cursor-cloud.md) owns its API evidence.
 muse also needs a worker-reachable credential before spawning, and the portable fleet path is the `<config>/muse/auth.json` credential stored by `muse login`, because a caller-only `META_API_KEY` does not cross a long-lived backend daemon.
 New harnesses get verified through a supervised trial task before joining the set.
 The verified adapter evidence - each harness's busy-state source, interrupt and exit behavior, skill-invocation syntax, and per-harness quirks - lives in [`.agents/skills/harness-adapters/SKILL.md`](../.agents/skills/harness-adapters/SKILL.md).
@@ -538,6 +548,11 @@ FM_PROCEVENT_CLAIM_ROOT=                # machine-wide source claim root; defaul
 FM_WHEN_OUTPUT_TAIL_BYTES=8192          # bound on the command-output tail inside one condition->action outcome document
 FM_CODEX_WATCH_CHECKPOINT=180   # seconds per foreground watcher checkpoint in Codex primary supervision
 FM_CREW_STATE_NM_TIMEOUT=10   # seconds allowed per no-mistakes query inside fm-crew-state.sh
+CURSOR_API_KEY=         # cursor-cloud only: Cursor Agents API key the shim authenticates with (docs/cursor-cloud-harness.md)
+FM_CURSOR_CLOUD_BASE=https://api.cursor.com  # cursor-cloud only: API base, for a test double
+FM_CURSOR_CLOUD_STREAM_RETRIES=5  # cursor-cloud only: event-stream reconnect attempts before a lost-contact escalation
+FM_CURSOR_CLOUD_CANCEL_WAIT=20    # cursor-cloud only: seconds spent confirming a cancel from the run endpoint
+FM_CURSOR_CLOUD_POLL=1            # cursor-cloud only: shim wait-loop interval in seconds
 FM_TEARDOWN_NM_TIMEOUT=10    # seconds allowed per no-mistakes query or abort inside fm-teardown.sh
 FM_CREW_STATE_RUNS_LIMIT=200  # recent no-mistakes run rows scanned when axi status cannot be attributed to the current code
 FM_CREW_STATE_BIN=bin/fm-crew-state.sh   # test override for the current-state reader used by working/paused watcher triage
